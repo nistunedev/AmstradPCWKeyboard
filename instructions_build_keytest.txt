@@ -1,0 +1,18 @@
+KEYTEST.COM build instructions
+==============================
+
+The project folder includes pasmo.exe, iDSK.exe, and build_keytest.bat.
+
+1. Open a command prompt in the project folder.
+2. Run the complete build and disk update:
+
+   build_keytest.bat
+
+The batch file performs these commands:
+
+   pasmo.exe --bin keytest.asm KEYTEST.COM
+   iDSK.exe CPM_14_keyboard.dsk -i KEYTEST.COM -t 1 -f
+   iDSK.exe CPM_14_keyboard.dsk -l
+
+PASMO --bin creates a headerless CP/M .COM image beginning at the program's
+ORG 0100h address. The iDSK -t 1 option imports it as binary.
