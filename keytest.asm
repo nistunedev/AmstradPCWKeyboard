@@ -1,9 +1,15 @@
-; KEYTEST.COM - PCW8256 CP/M keyboard matrix diagnostic
+; KEYTEST.COM - Amstrad PCW8256 CP/M keyboard matrix diagnostic
 ;
-; Continuously reads the 16 memory-mapped keyboard bytes at BFF0h-BFFFh
-; and displays each address, hexadecimal value, and eight-bit binary value.
-; Screen output uses CP/M BDOS functions 2 and 9. The keyboard memory range
-; is read only; the program never prints into or otherwise modifies it.
+; Reads the 16 memory-mapped PCW keyboard state bytes at BFF0h-BFFFh and
+; continuously displays each address, hexadecimal value, and eight-bit binary
+; value. Screen output uses CP/M BDOS functions 2 and 9. The keyboard memory
+; range is read only; the program never prints into or otherwise modifies it.
+;
+; Build with the Pasmo Z80 assembler:
+; https://pasmo.speccy.org/
+;
+; Insert KEYTEST.COM into the CP/M disk image with iDSK 0.20:
+; https://github.com/cpcsdk/idsk
 ;
         org     0100h
 

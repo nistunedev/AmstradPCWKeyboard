@@ -1,7 +1,14 @@
 KEYTEST.COM build instructions
 ==============================
 
+KEYTEST.COM is a CP/M diagnostic used for PCW-side keyboard-state testing.
+
 The project folder includes pasmo.exe, iDSK.exe, and build_keytest.bat.
+
+Tool sources:
+
+   Pasmo Z80 assembler: https://pasmo.speccy.org/
+   iDSK.exe 0.20: https://github.com/cpcsdk/idsk
 
 1. Open a command prompt in the project folder.
 2. Run the complete build and disk update:

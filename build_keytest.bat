@@ -1,6 +1,11 @@
 @echo off
 setlocal
 
+rem Build the PCW-side KEYTEST.COM keyboard-state diagnostic and update the
+rem CP/M test disk image.
+rem Pasmo Z80 assembler: https://pasmo.speccy.org/
+rem iDSK 0.20: https://github.com/cpcsdk/idsk
+
 set "PROJECT_DIR=%~dp0"
 set "PASMO=%PROJECT_DIR%pasmo.exe"
 set "IDSK=%PROJECT_DIR%iDSK.exe"

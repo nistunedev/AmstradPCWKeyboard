@@ -1,3 +1,15 @@
+/*
+ * Amstrad PCW8256 PS/2 Keyboard Emulator
+ *
+ * In-development firmware for an Arduino Nano acting as an Amstrad PCW8256
+ * keyboard emulator. It reads PS/2 keyboard make/break events, maintains a PCW
+ * keyboard state buffer, and continuously transmits PCW keyboard state frames
+ * through the original PCW keyboard clock/data interface.
+ *
+ * KEYTEST.COM is the PCW-side CP/M diagnostic used to observe the keyboard
+ * state bytes at BFF0h-BFFFh while testing and debugging.
+ */
+
 #include <Arduino.h>
 #include <PS2KeyAdvanced.h>
 // Include the Library Manager item: PS2KeyAdvanced (currently 1.0.9)
