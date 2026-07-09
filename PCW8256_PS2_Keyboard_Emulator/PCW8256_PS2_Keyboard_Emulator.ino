@@ -50,15 +50,19 @@ constexpr uint8_t PCW_DATA_PIN = 5;
 constexpr uint8_t PCW_FRAME_WORDS = 17;
 constexpr uint8_t PCW_FRAME_BITS = PCW_FRAME_WORDS * 12;
 constexpr uint8_t PCW_WORD_OFFSET_FLAG = 0x0F;
-constexpr uint8_t PCW_WORD_FLAG_UPDATE = 0x80;
+constexpr uint8_t PCW_WORD_OFFSET_LINK_STATUS = 0x0D;
+constexpr uint8_t PCW_WORD_OFFSET_OPTION_LINKS = 0x0E;
+constexpr uint8_t PCW_WORD_FLAG_TRANSMITTING = 0x80;
+constexpr uint8_t PCW_WORD_FLAG_UPDATE_TOGGLE = 0x40;
+constexpr uint8_t PCW_SHIFT_LOCK_LED_FLAG = 0x40;
+constexpr uint8_t PCW_LK2_NOT_FITTED_FLAG = 0x80;
 constexpr uint8_t PCW_INVALID_OFFSET = 0xFF;
 constexpr uint8_t PCW_IDLE_BYTE = 0xFF;
-constexpr uint16_t PCW_STARTUP_TEST_TOGGLE_MS = 500;
-constexpr uint8_t PCW_STARTUP_TEST_TOGGLES = 10;
 
-// One complete PCW bit is three Timer1 ticks: data setup/high, clock low,
-// clock high/advance. 7 us x 3 ~= 21 us per bit.
-constexpr uint16_t TIMER1_TICK_US = 7;
+// PCW timing follows the documented PC1512-compatible waveform:
+// data setup for 5 us, clock low for 5 us, then both lines high for 40 us.
+constexpr uint16_t TIMER1_TICK_US = 5;
+constexpr uint8_t PCW_IDLE_TICKS = 7;
 #ifdef PCW_DEBUG
 constexpr bool kDebugEnabled = true;
 #else
@@ -237,8 +241,12 @@ uint8_t holdCount[PCW_KEY_COUNT];
 volatile bool frameDirty = false;
 
 volatile uint8_t activeFrameIndex = 0;
+volatile uint8_t pendingFrameIndex = 0;
+volatile bool pendingFrameReady = false;
+volatile bool pcwUpdateToggle = false;
 volatile uint16_t txBitIndex = 0;
 volatile uint8_t txPhase = 0;
+volatile uint8_t txIdleTicks = 0;
 
 uint8_t frameBuffers[2][PCW_FRAME_BITS];
 uint16_t frameLengths[2] = {0, 0};
@@ -340,6 +348,23 @@ void initializePcwState()
   {
     ps2Held[i] = false;
   }
+
+  // The target keyboard has LK1, LK2, and LK3 not fitted.
+  // LK2 absent is reported as byte 0x0D bit 7 set. Shift Lock starts off.
+  pcwState[PCW_WORD_OFFSET_LINK_STATUS] =
+      static_cast<uint8_t>((PCW_IDLE_BYTE & ~PCW_SHIFT_LOCK_LED_FLAG) |
+                           PCW_LK2_NOT_FITTED_FLAG);
+  // LK1 and LK3 absent are reported as byte 0x0E bits 6 and 7 clear.
+  pcwState[PCW_WORD_OFFSET_OPTION_LINKS] =
+      static_cast<uint8_t>(PCW_IDLE_BYTE &
+                           ~(PCW_WORD_FLAG_UPDATE_TOGGLE |
+                             PCW_WORD_FLAG_TRANSMITTING));
+  // Byte 0x0F bits 6 and 7 are supplied by the packet transmitter.
+  pcwState[PCW_WORD_OFFSET_FLAG] =
+      static_cast<uint8_t>(PCW_IDLE_BYTE &
+                           ~(PCW_WORD_FLAG_UPDATE_TOGGLE |
+                             PCW_WORD_FLAG_TRANSMITTING));
+  frameDirty = true;
 }
 
 const PcwKeyMatrixEntry kPcwKeyboardMatrix[] PROGMEM = {
@@ -642,28 +667,55 @@ void sendPcwWord(uint8_t offset, uint8_t value)
 
 void sendPcwFrame()
 {
+  noInterrupts();
+  const bool shouldBuild = frameDirty && !pendingFrameReady;
+  interrupts();
+  if (!shouldBuild)
+  {
+    return;
+  }
+
   uint8_t snapshot[16];
+  bool updateToggle;
 
   noInterrupts();
   for (uint8_t i = 0; i < 16; ++i)
   {
     snapshot[i] = pcwState[i];
   }
+  updateToggle = pcwUpdateToggle;
   interrupts();
 
   beginFrameBuild();
-  sendPcwWord(PCW_WORD_OFFSET_FLAG, static_cast<uint8_t>(snapshot[PCW_WORD_OFFSET_FLAG] | PCW_WORD_FLAG_UPDATE));
+  const uint8_t flagValue =
+      static_cast<uint8_t>((snapshot[PCW_WORD_OFFSET_FLAG] &
+                            ~(PCW_WORD_FLAG_TRANSMITTING |
+                              PCW_WORD_FLAG_UPDATE_TOGGLE)) |
+                           (updateToggle ? PCW_WORD_FLAG_UPDATE_TOGGLE : 0));
+  sendPcwWord(PCW_WORD_OFFSET_FLAG,
+              static_cast<uint8_t>(flagValue |
+                                   PCW_WORD_FLAG_TRANSMITTING));
   for (uint8_t offset = 0; offset <= 0x0E; ++offset)
   {
     sendPcwWord(offset, snapshot[offset]);
   }
-  sendPcwWord(PCW_WORD_OFFSET_FLAG, static_cast<uint8_t>(snapshot[PCW_WORD_OFFSET_FLAG] & ~PCW_WORD_FLAG_UPDATE));
+  sendPcwWord(PCW_WORD_OFFSET_FLAG, flagValue);
 
   noInterrupts();
   frameLengths[buildFrameIndex] = buildBitCount;
-  activeFrameIndex = buildFrameIndex;
-  txBitIndex = 0;
-  txPhase = 0;
+  if (frameLengths[activeFrameIndex] == 0)
+  {
+    activeFrameIndex = buildFrameIndex;
+    txBitIndex = 0;
+    txPhase = 0;
+    txIdleTicks = 0;
+  }
+  else
+  {
+    pendingFrameIndex = buildFrameIndex;
+    pendingFrameReady = true;
+  }
+  frameDirty = false;
   interrupts();
 }
 
@@ -676,27 +728,6 @@ const __FlashStringHelper *activeDiagnosticModeName()
   #else
   return F("DIAG_FULL_EMULATOR");
   #endif
-}
-
-void runStartupHardwareTest()
-{
-  for (uint8_t i = 0; i < PCW_STARTUP_TEST_TOGGLES; ++i)
-  {
-    if ((i & 0x01U) == 0)
-    {
-      pcwClockLow();
-      pcwDataLow();
-    }
-    else
-    {
-      pcwClockHigh();
-      pcwDataHigh();
-    }
-    delay(PCW_STARTUP_TEST_TOGGLE_MS);
-  }
-
-  pcwClockHigh();
-  pcwDataHigh();
 }
 
 void applyKeyState(PcwKey key, bool pressed)
@@ -841,6 +872,23 @@ void updatePcwState(const KeyEvent &event)
 
   if (event.pressed)
   {
+    if (entry.key == PCW_KEY_SHIFT_LOCK)
+    {
+      noInterrupts();
+      pcwState[PCW_WORD_OFFSET_LINK_STATUS] ^= PCW_SHIFT_LOCK_LED_FLAG;
+      frameDirty = true;
+      interrupts();
+    }
+    else if (entry.key == PCW_KEY_SHIFT)
+    {
+      // With LK2 not fitted, either Shift key cancels Shift Lock.
+      noInterrupts();
+      pcwState[PCW_WORD_OFFSET_LINK_STATUS] &=
+          static_cast<uint8_t>(~PCW_SHIFT_LOCK_LED_FLAG);
+      frameDirty = true;
+      interrupts();
+    }
+
     if (holdCount[keyIndex] == 0)
     {
       applyKeyState(entry.key, true);
@@ -912,12 +960,37 @@ ISR(TIMER1_COMPA_vect)
 
     default:
       pcwClockHigh();
+      pcwDataHigh();
       ++txBitIndex;
       if (txBitIndex >= frameLength)
       {
         txBitIndex = 0;
+        pcwUpdateToggle = !pcwUpdateToggle;
+        if (pendingFrameReady)
+        {
+          activeFrameIndex = pendingFrameIndex;
+          pendingFrameReady = false;
+        }
+
+        const uint8_t nextFrame = activeFrameIndex;
+        const uint8_t toggleBit = pcwUpdateToggle ? 1 : 0;
+        frameBuffers[nextFrame][5] = toggleBit;
+        frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * 12U + 5U] =
+            toggleBit;
       }
-      txPhase = 0;
+      txIdleTicks = PCW_IDLE_TICKS;
+      txPhase = 3;
+      break;
+
+    case 3:
+      if (txIdleTicks > 0)
+      {
+        --txIdleTicks;
+      }
+      if (txIdleTicks == 0)
+      {
+        txPhase = 0;
+      }
       break;
   }
 }
@@ -937,13 +1010,8 @@ void setup()
   pinMode(PCW_DATA_PIN, OUTPUT);
   pcwClockHigh();
   pcwDataHigh();
-  runStartupHardwareTest();
 
   initializePcwState();
-
-  // TODO: Some PCW8256 keys may live in byte 0xF as real matrix bits. If so,
-  // reserve a non-conflicting bit for the update flag before filling the table.
-  pcwState[PCW_WORD_OFFSET_FLAG] |= PCW_WORD_FLAG_UPDATE;
 
   #if DIAG_PS2_ONLY || DIAG_FULL_EMULATOR
   keyboard.begin(PS2_DATA_PIN, PS2_CLK_PIN);

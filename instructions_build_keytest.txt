@@ -1,25 +1,60 @@
-KEYTEST.COM build instructions
-==============================
+KEYTEST.COM build and transfer instructions
+===========================================
 
-KEYTEST.COM is a CP/M diagnostic used for PCW-side keyboard-state testing.
+KEYTEST.COM continuously displays the PCW keyboard bytes at BFF0h-BFFFh and
+returns to CP/M when any key is pressed.
 
-The project folder includes pasmo.exe, iDSK.exe, and build_keytest.bat.
+KEYHELLO.COM is a minimal console diagnostic. Run it first when diagnosing a
+blank KEYTEST screen. It prints a BDOS message, waits for one key, and returns
+to CP/M.
 
-Tool sources:
-
-   Pasmo Z80 assembler: https://pasmo.speccy.org/
-   iDSK.exe 0.20: https://github.com/cpcsdk/idsk
+Build
+-----
 
 1. Open a command prompt in the project folder.
-2. Run the complete build and disk update:
+2. Run:
 
    build_keytest.bat
 
-The batch file performs these commands:
+Pasmo assembles both programs as headerless CP/M COM files in:
 
-   pasmo.exe --bin keytest.asm KEYTEST.COM
-   iDSK.exe CPM_14_keyboard.dsk -i KEYTEST.COM -t 1 -f
-   iDSK.exe CPM_14_keyboard.dsk -l
+   cpm_transfer
 
-PASMO --bin creates a headerless CP/M .COM image beginning at the program's
-ORG 0100h address. The iDSK -t 1 option imports it as binary.
+The build also copies INSTALL.SUB into that folder.
+
+Safe CP/M Box transfer
+----------------------
+
+CPM_14_keyboard.dsk is a SAMdisk Extended DSK. Do not modify it with the
+bundled iDSK 0.20 or the tested cpmtools build. Both misinterpret this image's
+track geometry and can create directory entries whose data loads as garbage.
+
+1. In CP/M Box, map the project's cpm_transfer folder as CP/M drive M:.
+2. Boot CP/M Plus with CPM_14_keyboard.dsk in drive A:.
+3. Run the installation submit file:
+
+   SUBMIT M:INSTALL
+
+INSTALL.SUB removes stale copies, copies KEYTEST.COM, KEYHELLO.COM, and
+INSTALL.SUB from M: to A:, then lists the A: directory.
+
+4. Run the minimal test first:
+
+   KEYHELLO
+
+5. If KEYHELLO works, run:
+
+   KEYTEST
+
+6. Use CP/M Box's Drive A / Dump command to save the modified disk image.
+
+Background
+----------
+
+An earlier ChatGPT-generated build used iDSK file type 1, which added an
+AMSDOS header to KEYTEST.COM. Changing to raw type 2 removed that header, but
+iDSK still wrote the Extended DSK using incompatible track geometry. CP/M Box
+then loaded repeating filler bytes instead of the assembled COM program.
+
+The M: drive and PIP procedure avoids external disk-geometry handling and lets
+the emulated CP/M BIOS write the disk correctly.

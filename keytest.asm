@@ -4,6 +4,7 @@
 ; continuously displays each address, hexadecimal value, and eight-bit binary
 ; value. Screen output uses CP/M BDOS functions 2 and 9. The keyboard memory
 ; range is read only; the program never prints into or otherwise modifies it.
+; Pressing any key exits through the CP/M warm-boot entry at address 0000h.
 ;
 ; Build with the Pasmo Z80 assembler:
 ; https://pasmo.speccy.org/
@@ -16,11 +17,14 @@
 BDOS    equ     0005h
 
 start:
+        ld      sp,stack_top
         ld      de,clear_screen
         call    print_string
 
 refresh:
         ld      de,cursor_home
+        call    print_string
+        ld      de,title
         call    print_string
 
         ld      hl,0bff0h
@@ -54,8 +58,13 @@ row:
         djnz    row
 
         call    delay
-        ; Return to the top of the screen for the next live snapshot.
-        jr      refresh
+        call    key_available
+        or      a
+        ; Return to the top of the screen if no exit key is waiting.
+        jr      z,refresh
+        ld      c,1
+        call    BDOS
+        jp      0000h
 
 print_hex16:
         ld      a,h
@@ -126,6 +135,17 @@ print_string:
         pop     bc
         ret
 
+key_available:
+        push    bc
+        push    de
+        push    hl
+        ld      c,11
+        call    BDOS
+        pop     hl
+        pop     de
+        pop     bc
+        ret
+
 delay:
         push    bc
         push    de
@@ -148,5 +168,11 @@ clear_screen:
         db      1bh,'E','$'
 cursor_home:
         db      1bh,'H','$'
+title:
+        db      'KEYTEST.COM running - reading BFF0h-BFFFh',13,10
+        db      'Press any key to exit',13,10,'$'
+
+        defs    64
+stack_top:
 
         end     start
