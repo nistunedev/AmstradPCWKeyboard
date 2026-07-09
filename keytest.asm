@@ -1,9 +1,9 @@
 ; KEYTEST.COM - Amstrad PCW8256 CP/M keyboard matrix diagnostic
 ;
-; Reads the 16 memory-mapped PCW keyboard state bytes at BFF0h-BFFFh and
-; continuously displays each address, hexadecimal value, and eight-bit binary
-; value. Screen output uses CP/M BDOS functions 2 and 9. The keyboard memory
-; range is read only; the program never prints into or otherwise modifies it.
+; Maps physical memory block 3 into the 8000h-BFFFh CPU window, copies the
+; keyboard state bytes from BFF0h-BFFFh into local memory, restores CP/M's TPA
+; block 6, and displays the physical offsets 3FF0h-3FFFh. Screen output uses
+; CP/M BDOS functions 2 and 9.
 ; Pressing any key exits through the CP/M warm-boot entry at address 0000h.
 ;
 ; Build with the Pasmo Z80 assembler:
@@ -15,6 +15,11 @@
         org     0100h
 
 BDOS    equ     0005h
+MEMORY_PAGE_2_PORT equ 0f2h
+KEYBOARD_BLOCK     equ 083h
+TPA_BLOCK          equ 086h
+KEYBOARD_ADDRESS   equ 0bff0h
+KEYBOARD_BYTES     equ 16
 
 start:
         ld      sp,stack_top
@@ -26,26 +31,29 @@ refresh:
         call    print_string
         ld      de,title
         call    print_string
+        ld      de,build_timestamp
+        call    print_string
 
-        ld      hl,0bff0h
-        ld      b,16
+        call    snapshot_keyboard
+
+        ld      hl,keyboard_snapshot
+        ld      de,03ff0h
+        ld      b,KEYBOARD_BYTES
 
 row:
-        push    hl
-        call    print_hex16
-        pop     hl
+        call    print_hex16_de
 
         ld      a,' '
         call    put_char
 
-        ld      d,(hl)
-        ld      a,d
+        ld      c,(hl)
+        ld      a,c
         call    print_hex8
 
         ld      a,' '
         call    put_char
 
-        ld      a,d
+        ld      a,c
         call    print_binary8
 
         ld      a,13
@@ -54,22 +62,41 @@ row:
         call    put_char
 
         inc     hl
+        inc     de
         ; Continue until all 16 keyboard bytes have been displayed.
         djnz    row
 
         call    delay
-        call    key_available
-        or      a
-        ; Return to the top of the screen if no exit key is waiting.
-        jr      z,refresh
-        ld      c,1
-        call    BDOS
+        call    read_console_nonblocking
+        cp      1bh
+        jr      nz,refresh
         jp      0000h
 
-print_hex16:
-        ld      a,h
+snapshot_keyboard:
+        push    af
+        push    bc
+        push    de
+        push    hl
+        di
+        ld      a,KEYBOARD_BLOCK
+        out     (MEMORY_PAGE_2_PORT),a
+        ld      hl,KEYBOARD_ADDRESS
+        ld      de,keyboard_snapshot
+        ld      bc,KEYBOARD_BYTES
+        ldir
+        ld      a,TPA_BLOCK
+        out     (MEMORY_PAGE_2_PORT),a
+        ei
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        ret
+
+print_hex16_de:
+        ld      a,d
         call    print_hex8
-        ld      a,l
+        ld      a,e
         call    print_hex8
         ret
 
@@ -95,6 +122,7 @@ print_hex_digit_ready:
 
 print_binary8:
         push    bc
+        push    de
         ld      e,a
         ld      b,8
 print_binary_bit:
@@ -107,6 +135,7 @@ print_binary_digit:
         call    put_char
         ; Repeat until all eight bits have been printed, most significant first.
         djnz    print_binary_bit
+        pop     de
         pop     bc
         ret
 
@@ -135,11 +164,12 @@ print_string:
         pop     bc
         ret
 
-key_available:
+read_console_nonblocking:
         push    bc
         push    de
         push    hl
-        ld      c,11
+        ld      e,0ffh
+        ld      c,6
         call    BDOS
         pop     hl
         pop     de
@@ -169,10 +199,18 @@ clear_screen:
 cursor_home:
         db      1bh,'H','$'
 title:
-        db      'KEYTEST.COM running - reading BFF0h-BFFFh',13,10
-        db      'Press any key to exit',13,10,'$'
+        db      'KEYTEST.COM running - physical block 3, 3FF0h-3FFFh',13,10
+        db      'Press ESC to exit',13,10,'$'
+build_timestamp:
+        include "build_timestamp.inc"
+
+keyboard_snapshot:
+        defs    KEYBOARD_BYTES
 
         defs    64
 stack_top:
+
+        ; Keep the COM image on complete 128-byte CP/M record boundaries.
+        defs    512-($-0100h),0e5h
 
         end     start
