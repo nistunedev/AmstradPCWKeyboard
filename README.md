@@ -49,7 +49,17 @@ diagnostic utility. The diagnostic can also be rebuilt and inserted by running
 - [iDSK 0.20](https://github.com/cpcsdk/idsk)
 
 ## Notes from John Elliots PCW Hardware Guide
+PDF:
 https://www.seasip.info/Unix/Joyce/hardware.pdf
+HTML:
+https://www.seasip.info/Unix/Joyce/pcwkbd.html
+
+Revisiions by James Ols
+https://hackaday.io/project/27549-the-pcw-project/log/70757-keyboard-timings
+
+# Hardware
+
+Both keyboards use the same controller: an 8048, part number 40027.
 
 # PCW Keyboard
 
@@ -61,7 +71,18 @@ Using the key numbering scheme in the PCW manual:
 - Key 72 corresponds to bit 7 of byte 9.
 - Keys 73–80 correspond to bits 0–7 of byte 10.
 
-The entries marked J1 and J2 are for keyboard joysticks.
+The entries marked J1 and J2 are for keyboard joysticks. The PCW keyboard has no joystick sockets, but the controller leaves space for them in the keyboard matrix.
+
+Bits 5-0 of the last four bytes (0xC-0xF) are for keyboard joysticks — sets of keys that could be used directionally. The assignments correspond to the joystick entries; so bit 0 is up, bit 1 is down and so on.
+
+The W / A / D / X keyboard joystick is only available if link LK2 is connected.
+
+Bit 6 of byte 0xD returns the state of the Shift Lock LED. This is controlled by the keyboard and cannot be set by the PCW.
+The status of the three option links is reported in the top two bits of bytes 0xD and 0xE. However, if LK1 is present, the keyboard enters a self-test mode, so in normal use bit 6 of byte 0xE will never be set. For some reason the state of LK2 is inverted, so on a stock keyboard with this link disconnected, the corresponding status bit is 1.
+
+Bit 7 of byte 0xF is set when the keyboard is transmitting data to the host, reset when it is scanning the keys. This is the reason why a keyboard data packet is 17 bytes; the first byte sets bit 7 of byte 0xF, and the last byte resets it.
+
+Bit 6 of byte 0xF is toggled each time the keyboard transmits its state.
 
 The last four bytes contain controller status in bits 6 and 7. Bits 0–5 of each byte are used (by analogy with the two joystick entries) to provide keyboard combinations that may be useful as joysticks.
 
@@ -70,8 +91,6 @@ The last four bytes contain controller status in bits 6 and 7. Bits 0–5 of eac
 ### 3FFCh
 
 3FFCh gives an inverted T pattern centred on F1.
-
-If link LK2 is present, it will also respond to a W/A/D/X diamond, with S as Fire 1 and Shift as Fire 2.
 
 ### 3FFDh
 
@@ -99,8 +118,6 @@ Bit 7:
 Bit 6:
 - 1 if LK1 is present
 - 0 if not present
-
-However, if LK1 is present the keyboard enters a self-test mode and transmits test patterns rather than these flags.
 
 Bit 7:
 - 1 if LK3 is present
@@ -130,7 +147,8 @@ If no keyboard is present, all 16 bytes of the memory map are zero.
 ## 10.2 Keyboard Links
 The keyboard has three option links. By default they are all disconnected. 
 
-LK1: If connected, puts the keyboard into a test mode in which it repeatedly sends various patterns of data to the PCW. The Shift Lock LED will be constantly lit (or, more accurately, blinking faster than you can see).
+LK1: If connected, puts the keyboard into a test mode in which it repeatedly sends various patterns of test data to the PCW. The Shift Lock LED will be constantly lit (or, more accurately, blinking faster than you can see).
+
 LK2: If connected, pressing Shift does not cancel Shift Lock. Also enables W/A/D/X joystick, and resets bit 7 of byte 3FFDh.
 LK3: If connected, sets bit 7 of byte 3FFEh. Has no other effects.
 
@@ -143,10 +161,37 @@ keyboard, but the PC1512 does)
 ## 10.4 Physical connection
 The pinout above shows the keyboard socket on the PCW, seen from the outside of the case. The voltages used for signalling appear to be less than TTL normal, though the PCW9512 (and probably the other models) can take signals at TTL levels without apparent harm
 
-## 10.4.1 Wire protocol
-By default, the data and clock lines are high. To send a bit, the keyboard drives the data line low or high, pulls the clock line low, and then a little later returns them both to high. Exact timings are unknown, though the PCW motherboard seems happy to accept timings similar to those used by the PC1512 keyboard (set data, wait for 5µs, set clock, wait for 5µs, return both lines to high, wait for 40µs).
+## 10.4.1 Hardware connection
+By default, the data and clock lines are high on the motherboard (confirmed via scope). Although they are pulled high on the PCW motherboard, they are actually driven low most of the time (by the keyboard when it is active)
+
+Verifying the circuit diagrams: Confirmed that DATA and CLK signals go into a TC74HC14 (schmit trigger inverter) twice. Effectively inverting the signal and then reversing the signal, acting as a buffer. Both signals have a 100K pullup to 5VCC, explaining the internal pull up on the PCW.
+
+On the keyboard side, the CLK and DATA lines enter via 470 ohm resistors, which are then pulled up to 5VCC by what appears to be 47K ohm resistors
+
+
+## 10.4.2 Clock signal 
+From James:
+
+Clock pulses note that there's only a 21µs gap between most clock pulses, although there is a 48µs gap after the fourth clock pulse.
+
+The data signal is valid on the back-end of the clock signal, not at the start. (Although since his clock signal is inverted, it is actually correct that it is valid on the falling edge of the clock!)
+
+Assumption:
+So long as the clock signal is within certain tolerances I would guess that the gate array just clocks the signal in on the falling edge of the clock.
+
+To send a bit, the keyboard drives the data line low or high, pulls the clock line low, and then a little later returns them both to high. 
+
+Notes:
+Exact timings are unknown, though the PCW motherboard seems happy to accept timings similar to those used by the PC1512 keyboard (set data, wait for 5µs, set clock, wait for 5µs, return both lines to high, wait for 40µs).
+
+## 10.4.2 Wire protocol
+Unlike a PC keyboard, the PCW keyboard does not send scancodes. Instead, it repeatedly sends the entire keyboard state: 17 words of 12 bits each
 
 A keycode is 12 bits long, with the most significant bit first. The first four bits are the offset in the memory map (0-0Fh), and the last eight bits are the value to be placed into memory at that address. The PCW keyboard toggles the DATA line twice before sending each word, but the gate array at the PCW end doesn’t seem to need this.
 
-When transmitting its state, the controller sends a 17-keycode packet. The first word is byte 0Fh, with the top bit set to 1; then bytes 0-0Eh; then byte 0Fh again, with the top bit set to 0.
+1. Full keyboard state is 17 words; 
+2. When transmitting its state, the controller sends a 17-keycode (word) packet representing the full keyboard state
+3. First word word is byte 0Fh with the top bit set to 1;
+4. Next words are bytes 0-0Eh;
+5. Last words is byte 0Fh with the top bit set to 0.
 

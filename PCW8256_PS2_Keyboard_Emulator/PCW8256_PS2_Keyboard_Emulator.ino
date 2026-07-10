@@ -23,8 +23,8 @@
 // Pinout:
 // PS/2 keyboard CLK  -> D2
 // PS/2 keyboard DATA -> D4
-// PCW keyboard CLK   -> D3
-// PCW keyboard DATA  -> D5
+// PCW keyboard CLK   -> D3, open-collector style, released with INPUT_PULLUP
+// PCW keyboard DATA  -> D5, open-collector style, released with INPUT_PULLUP
 // Common GND
 //
 // The PCW +5V keyboard rail may be able to power both the Nano and the PS/2
@@ -55,14 +55,23 @@ constexpr uint8_t PCW_WORD_OFFSET_OPTION_LINKS = 0x0E;
 constexpr uint8_t PCW_WORD_FLAG_TRANSMITTING = 0x80;
 constexpr uint8_t PCW_WORD_FLAG_UPDATE_TOGGLE = 0x40;
 constexpr uint8_t PCW_SHIFT_LOCK_LED_FLAG = 0x40;
-constexpr uint8_t PCW_LK2_NOT_FITTED_FLAG = 0x80;
 constexpr uint8_t PCW_INVALID_OFFSET = 0xFF;
-constexpr uint8_t PCW_IDLE_BYTE = 0xFF;
+constexpr uint8_t PCW_IDLE_BYTE = 0x00;
 
-// PCW timing follows the documented PC1512-compatible waveform:
-// data setup for 5 us, clock low for 5 us, then both lines high for 40 us.
-constexpr uint16_t TIMER1_TICK_US = 5;
-constexpr uint8_t PCW_IDLE_TICKS = 7;
+// PCW timing follows the observed 8048 keyboard waveform:
+// clock high/setup is about 12 us, clock low is about 21 us, and the fourth
+// clock pulse of each 12-bit word has a longer about 48 us low period.
+constexpr uint16_t TIMER1_PRESCALER = 8;
+constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;
+constexpr uint8_t PCW_CLOCK_HIGH_US = 12;
+constexpr uint8_t PCW_CLOCK_RECOVERY_US = 4;
+constexpr uint8_t PCW_DATA_SETUP_US = PCW_CLOCK_HIGH_US - PCW_CLOCK_RECOVERY_US;
+constexpr uint8_t PCW_CLOCK_LOW_US = 21;
+constexpr uint8_t PCW_FOURTH_CLOCK_LOW_US = 48;
+constexpr uint16_t PCW_FRAME_GAP_US = 6250;
+constexpr uint16_t PCW_FRAME_IDLE_US = PCW_FRAME_GAP_US - PCW_CLOCK_HIGH_US;
+constexpr char BUILD_DATE[] = __DATE__;
+constexpr char BUILD_TIME[] = __TIME__;
 #ifdef PCW_DEBUG
 constexpr bool kDebugEnabled = true;
 #else
@@ -245,8 +254,9 @@ volatile uint8_t pendingFrameIndex = 0;
 volatile bool pendingFrameReady = false;
 volatile bool pcwUpdateToggle = false;
 volatile uint16_t txBitIndex = 0;
+volatile uint8_t txBitInWord = 0;
+volatile uint8_t txCurrentClockLowUs = PCW_CLOCK_LOW_US;
 volatile uint8_t txPhase = 0;
-volatile uint8_t txIdleTicks = 0;
 
 uint8_t frameBuffers[2][PCW_FRAME_BITS];
 uint16_t frameLengths[2] = {0, 0};
@@ -314,22 +324,32 @@ bool isIgnoredPs2Code(uint8_t code)
 
 inline void pcwClockHigh()
 {
+  DDRD &= static_cast<uint8_t>(~_BV(PD3));
   PORTD |= _BV(PD3);
 }
 
 inline void pcwClockLow()
 {
   PORTD &= static_cast<uint8_t>(~_BV(PD3));
+  DDRD |= _BV(PD3);
 }
 
 inline void pcwDataHigh()
 {
+  DDRD &= static_cast<uint8_t>(~_BV(PD5));
   PORTD |= _BV(PD5);
 }
 
 inline void pcwDataLow()
 {
   PORTD &= static_cast<uint8_t>(~_BV(PD5));
+  DDRD |= _BV(PD5);
+}
+
+inline void scheduleTimer1Us(uint16_t microseconds)
+{
+  TCNT1 = 0;
+  OCR1A = static_cast<uint16_t>((microseconds * TIMER1_COUNTS_PER_US) - 1U);
 }
 
 void initializePcwState()
@@ -350,20 +370,10 @@ void initializePcwState()
   }
 
   // The target keyboard has LK1, LK2, and LK3 not fitted.
-  // LK2 absent is reported as byte 0x0D bit 7 set. Shift Lock starts off.
-  pcwState[PCW_WORD_OFFSET_LINK_STATUS] =
-      static_cast<uint8_t>((PCW_IDLE_BYTE & ~PCW_SHIFT_LOCK_LED_FLAG) |
-                           PCW_LK2_NOT_FITTED_FLAG);
-  // LK1 and LK3 absent are reported as byte 0x0E bits 6 and 7 clear.
-  pcwState[PCW_WORD_OFFSET_OPTION_LINKS] =
-      static_cast<uint8_t>(PCW_IDLE_BYTE &
-                           ~(PCW_WORD_FLAG_UPDATE_TOGGLE |
-                             PCW_WORD_FLAG_TRANSMITTING));
-  // Byte 0x0F bits 6 and 7 are supplied by the packet transmitter.
-  pcwState[PCW_WORD_OFFSET_FLAG] =
-      static_cast<uint8_t>(PCW_IDLE_BYTE &
-                           ~(PCW_WORD_FLAG_UPDATE_TOGGLE |
-                             PCW_WORD_FLAG_TRANSMITTING));
+  pcwState[PCW_WORD_OFFSET_LINK_STATUS] = 0x80;
+  pcwState[PCW_WORD_OFFSET_OPTION_LINKS] = 0x00;
+  pcwState[PCW_WORD_OFFSET_FLAG] = 0xC0;
+  pcwUpdateToggle = true;
   frameDirty = true;
 }
 
@@ -642,6 +652,29 @@ bool findJoystickMatrixEntry(PcwKey key, PcwMatrixEntry &result)
   return findMatrixEntry(kPcwJoystickMatrix, kPcwJoystickMatrixCount, key, result);
 }
 
+void loadCurrentPcwData()
+{
+  const uint8_t bitValue = frameBuffers[activeFrameIndex][txBitIndex];
+  if (bitValue)
+  {
+    pcwDataHigh();
+  }
+  else
+  {
+    pcwDataLow();
+  }
+}
+
+void startCurrentPcwBit()
+{
+  loadCurrentPcwData();
+  txCurrentClockLowUs =
+      (txBitInWord == 3U) ? PCW_FOURTH_CLOCK_LOW_US : PCW_CLOCK_LOW_US;
+  pcwClockHigh();
+  scheduleTimer1Us(PCW_CLOCK_HIGH_US);
+  txPhase = 1;
+}
+
 void beginFrameBuild()
 {
   buildFrameIndex = activeFrameIndex ^ 0x01;
@@ -707,8 +740,8 @@ void sendPcwFrame()
   {
     activeFrameIndex = buildFrameIndex;
     txBitIndex = 0;
+    txBitInWord = 0;
     txPhase = 0;
-    txIdleTicks = 0;
   }
   else
   {
@@ -762,11 +795,11 @@ void applyKeyState(PcwKey key, bool pressed)
   noInterrupts();
   if (pressed)
   {
-    pcwState[matrixEntry.offset] &= static_cast<uint8_t>(~mask);
+    pcwState[matrixEntry.offset] |= mask;
   }
   else
   {
-    pcwState[matrixEntry.offset] |= mask;
+    pcwState[matrixEntry.offset] &= static_cast<uint8_t>(~mask);
   }
   updatedByte = pcwState[matrixEntry.offset];
   frameDirty = true;
@@ -919,7 +952,7 @@ void setupTimer1()
   TCCR1B = 0;
   TCCR1B |= _BV(WGM12);
   TCCR1B |= _BV(CS11);
-  OCR1A = static_cast<uint16_t>((F_CPU / 8UL / (1000000UL / TIMER1_TICK_US)) - 1UL);
+  scheduleTimer1Us(PCW_CLOCK_HIGH_US);
   TIMSK1 |= _BV(OCIE1A);
   sei();
 }
@@ -936,35 +969,30 @@ ISR(TIMER1_COMPA_vect)
     return;
   }
 
-  const uint8_t bitValue = frameBuffers[currentFrame][txBitIndex];
-
   switch (txPhase)
   {
     case 0:
-      if (bitValue)
-      {
-        pcwDataHigh();
-      }
-      else
-      {
-        pcwDataLow();
-      }
-      pcwClockHigh();
-      txPhase = 1;
+      startCurrentPcwBit();
       break;
 
     case 1:
       pcwClockLow();
+      scheduleTimer1Us(txCurrentClockLowUs);
       txPhase = 2;
       break;
 
-    default:
+    case 2:
       pcwClockHigh();
-      pcwDataHigh();
       ++txBitIndex;
+      ++txBitInWord;
+      if (txBitInWord >= 12U)
+      {
+        txBitInWord = 0;
+      }
       if (txBitIndex >= frameLength)
       {
         txBitIndex = 0;
+        txBitInWord = 0;
         pcwUpdateToggle = !pcwUpdateToggle;
         if (pendingFrameReady)
         {
@@ -977,20 +1005,30 @@ ISR(TIMER1_COMPA_vect)
         frameBuffers[nextFrame][5] = toggleBit;
         frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * 12U + 5U] =
             toggleBit;
+        pcwDataHigh();
+        scheduleTimer1Us(PCW_FRAME_IDLE_US);
+        txPhase = 3;
+        break;
       }
-      txIdleTicks = PCW_IDLE_TICKS;
-      txPhase = 3;
+      scheduleTimer1Us(PCW_CLOCK_RECOVERY_US);
+      txPhase = 4;
       break;
 
     case 3:
-      if (txIdleTicks > 0)
-      {
-        --txIdleTicks;
-      }
-      if (txIdleTicks == 0)
-      {
-        txPhase = 0;
-      }
+      startCurrentPcwBit();
+      break;
+
+    case 4:
+      loadCurrentPcwData();
+      scheduleTimer1Us(PCW_DATA_SETUP_US);
+      txPhase = 1;
+      break;
+
+    default:
+      pcwClockHigh();
+      pcwDataHigh();
+      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
+      txPhase = 0;
       break;
   }
 }
@@ -1000,14 +1038,18 @@ void setup()
 {
   Serial.begin(115200);
   Serial.println(F("PCW keyboard emulator startup"));
+  Serial.print(F("Build: "));
+  Serial.print(BUILD_DATE);
+  Serial.print(F(" "));
+  Serial.println(BUILD_TIME);
   Serial.print(F("Active mode: "));
   Serial.println(activeDiagnosticModeName());
 
   pinMode(PS2_CLK_PIN, INPUT_PULLUP);
   pinMode(PS2_DATA_PIN, INPUT_PULLUP);
 
-  pinMode(PCW_CLK_PIN, OUTPUT);
-  pinMode(PCW_DATA_PIN, OUTPUT);
+  pinMode(PCW_CLK_PIN, INPUT_PULLUP);
+  pinMode(PCW_DATA_PIN, INPUT_PULLUP);
   pcwClockHigh();
   pcwDataHigh();
 
