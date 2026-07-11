@@ -13,13 +13,9 @@ echo Assembling KEYTEST.COM...
 pasmo --bin "%PROJECT_DIR%keytest.asm" "%PROJECT_DIR%KEYTEST.COM"
 if errorlevel 1 goto :error
 
-echo Assembling KEYHELLO.COM...
-pasmo --bin "%PROJECT_DIR%keyhello.asm" "%PROJECT_DIR%KEYHELLO.COM"
-if errorlevel 1 goto :error
 
 echo Preparing CP/M transfer folder...
 copy /Y "%PROJECT_DIR%KEYTEST.COM" "%TRANSFER_DIR%\KEYTEST.COM" > nul
-copy /Y "%PROJECT_DIR%KEYHELLO.COM" "%TRANSFER_DIR%\KEYHELLO.COM" > nul
 copy /Y "%PROJECT_DIR%install.sub" "%TRANSFER_DIR%\INSTALL.SUB" > nul
 
 echo.
