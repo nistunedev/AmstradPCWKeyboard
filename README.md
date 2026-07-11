@@ -9,6 +9,8 @@ The Arduino continuously transmits PCW keyboard matrix/state frames to the
 PCW8256 through the original keyboard clock and data interface. The target
 machine for this firmware is the Amstrad PCW8256.
 
+![Amstrad PCW keyboard](images/pcw_keyboard.gif)
+
 The active firmware is:
 
 `PCW8256_PS2_Keyboard_Emulator/PCW8256_PS2_Keyboard_Emulator.ino`
@@ -25,6 +27,10 @@ source.
 Verify connector pinout, voltage, current capacity, and common ground before
 connecting the Arduino, PS/2 keyboard, or PCW8256. The emulator is still in
 development and should be tested carefully.
+
+PS/2 keyboard socket (female, front view):
+
+![PS/2 female connector](images/PS2-female.png)
 
 ## Testing
 
@@ -56,6 +62,13 @@ The transmitter and PS/2 key path have been validated with a logic analyser
   in the transmitted frame and clears it on release, with all other bytes
   unchanged. This exercises the full chain: PS/2 make/break → key map → matrix
   → frame build → ISR bit-bang → correctly framed PCW output.
+
+Logic-analyser capture of one frame (WORD0 highlighted) and the start-of-frame
+detail used to verify DATA/CLK alignment:
+
+![Frame with WORD0 highlighted](images/PCW%20James%20Logic%20frame1%20highlighted.png)
+
+![Start-of-frame zoom](images/PCW%20James%20Logic%20frame1%20zoomed.png)
 
 Diagnostic build flags at the top of the firmware select the run mode
 (`DIAG_FULL_EMULATOR` for normal operation, `DIAG_PS2_ONLY` to dump decoded
@@ -104,6 +117,10 @@ Both keyboards use the same controller: an 8048, part number 40027.
 
 # PCW Keyboard
 
+Keyboard matrix from the PCW9512 service manual:
+
+![PCW keyboard matrix (service manual)](images/PCW%20keyboard%20matrix%20-%20service%20manual.png)
+
 The keyboard appears as a memory-mapped device at 3FF0h–3FFFh in memory block 3.
 
 Using the key numbering scheme in the PCW manual:
@@ -113,6 +130,10 @@ Using the key numbering scheme in the PCW manual:
 - Keys 73–80 correspond to bits 0–7 of byte 10.
 
 The entries marked J1 and J2 are for keyboard joysticks. The PCW keyboard has no joystick sockets, but the controller leaves space for them in the keyboard matrix.
+
+Memory-map key layout (byte/bit of each key):
+
+![PCW keyboard memory key map](images/PCW%20Keyboard%20memory%20keys%20matrix.png)
 
 Bits 5-0 of the last four bytes (0xC-0xF) are for keyboard joysticks — sets of keys that could be used directionally. The assignments correspond to the joystick entries; so bit 0 is up, bit 1 is down and so on.
 
@@ -128,6 +149,10 @@ Bit 6 of byte 0xF is toggled each time the keyboard transmits its state.
 The last four bytes contain controller status in bits 6 and 7. Bits 0–5 of each byte are used (by analogy with the two joystick entries) to provide keyboard combinations that may be useful as joysticks.
 
 ## Controller Status Bytes
+
+Memory-mapped control/status matrix (bytes 0xC–0xF):
+
+![PCW keyboard memory control matrix](images/PCW%20keyboard%20memory%20control%20matrix.png)
 
 ### 3FFCh
 
@@ -203,15 +228,28 @@ keyboard, but the PC1512 does)
 The pinout above shows the keyboard socket on the PCW, seen from the outside of the case. The voltages used for signalling appear to be less than TTL normal, though the PCW9512 (and probably the other models) can take signals at TTL levels without apparent harm
 
 ## 10.4.1 Hardware connection
+
+![PCW keyboard connector pinout](images/PCW-connector.png)
+
 By default, the data and clock lines are high on the motherboard (confirmed via scope). Although they are pulled high on the PCW motherboard, they are actually driven low most of the time (by the keyboard when it is active)
 
 Verifying the circuit diagrams: Confirmed that DATA and CLK signals go into a TC74HC14 (schmit trigger inverter) twice. Effectively inverting the signal and then reversing the signal, acting as a buffer. Both signals have a 100K pullup to 5VCC, explaining the internal pull up on the PCW.
 
-On the keyboard side, the CLK and DATA lines enter via 470 ohm resistors, which are then pulled up to 5VCC by what appears to be 47K ohm resistors
+![PCW keyboard input to ASIC](images/PCW-keyboard-input-to-ASIC.png)
+
+On the keyboard side, the CLK and DATA lines enter via 470 ohm resistors, which are then pulled up to 5VCC by 4.7K ohm resistors. Internally the PCW has protection diodes to ground on both lines.
+
+![PCW keyboard connector resistors](images/PCW%20keyboard%20connector%20resistors.png)
+
+Emulator wiring (Arduino Nano to the PCW keyboard connector, with series and pull-up resistors):
+
+![Emulator schematic](images/schematic.png)
 
 
 ## 10.4.2 Clock signal 
 From James:
+
+![James PCW keyboard logic analysis](images/James_PCW_Keyboard_logic_analysis.png)
 
 Clock pulses note that there's only a 21µs gap between most clock pulses, although there is a 48µs gap after the fourth clock pulse.
 
