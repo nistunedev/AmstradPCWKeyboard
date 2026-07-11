@@ -1,11 +1,13 @@
 KEYTEST.COM build and transfer instructions
 ===========================================
 
-KEYTEST.COM continuously displays the PCW keyboard bytes at BFF0h-BFFFh and
-returns to CP/M when any key is pressed.
+KEYTEST.COM continuously snapshots the PCW keyboard bytes at BFF0h-BFFFh,
+ORs them into a latch buffer, displays the latched bits at 3FF0h-3FFFh,
+and clears the latch after each display refresh.
 
-KEYHELLO.COM is a minimal console diagnostic. Run it first when diagnosing a
-blank KEYTEST screen. It prints a BDOS message, waits for one key, and returns
+KEYTEST never reads the console, so phantom key streams cannot exit it; reset
+the PCW to leave the diagnostic. KEYHELLO.COM is a minimal console diagnostic.
+Run it first when diagnosing a blank KEYTEST screen. It prints a BDOS message, waits for one key, and returns
 to CP/M.
 
 Build

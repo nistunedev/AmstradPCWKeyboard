@@ -1,8 +1,9 @@
 ; KEYTEST.COM - Amstrad PCW8256 CP/M keyboard matrix diagnostic
 ;
 ; Maps physical memory block 3 into the 8000h-BFFFh CPU window, copies the
-; keyboard state bytes from BFF0h-BFFFh into local memory, restores CP/M's TPA
-; block 6, and displays the physical offsets 3FF0h-3FFFh. Screen output uses
+; keyboard state bytes from BFF0h-BFFFh into local memory, ORs them into a
+; latch buffer, restores CP/M's TPA block 6, and displays the latched
+; physical offsets 3FF0h-3FFFh. The latch is cleared after each display, Screen output uses
 ; CP/M BDOS functions 2 and 9.
 ; The display refreshes continuously and the program NEVER reads the console,
 ; so stray/phantom key characters (as seen from a faulty keyboard) cannot
@@ -39,8 +40,9 @@ refresh:
         call    print_string
 
         call    snapshot_keyboard
+        call    latch_snapshot
 
-        ld      hl,keyboard_snapshot
+        ld      hl,keyboard_latch
         ld      de,03ff0h
         ld      b,KEYBOARD_BYTES
 
@@ -70,7 +72,8 @@ row:
         ; Continue until all 16 keyboard bytes have been displayed.
         djnz    row
 
-        call    delay
+        call    clear_latch
+        call    sample_latch_delay
         ; Loop forever. The console is never read, so a phantom key stream
         ; from a faulty keyboard cannot exit the program. Reset to leave.
         jr      refresh
@@ -96,6 +99,42 @@ snapshot_keyboard:
         pop     af
         ret
 
+latch_snapshot:
+        push    af
+        push    bc
+        push    de
+        push    hl
+        ld      hl,keyboard_snapshot
+        ld      de,keyboard_latch
+        ld      b,KEYBOARD_BYTES
+latch_snapshot_loop:
+        ld      a,(de)
+        or      (hl)
+        ld      (de),a
+        inc     hl
+        inc     de
+        djnz    latch_snapshot_loop
+        pop     hl
+        pop     de
+        pop     bc
+        pop     af
+        ret
+
+clear_latch:
+        push    af
+        push    bc
+        push    hl
+        xor     a
+        ld      hl,keyboard_latch
+        ld      b,KEYBOARD_BYTES
+clear_latch_loop:
+        ld      (hl),a
+        inc     hl
+        djnz    clear_latch_loop
+        pop     hl
+        pop     bc
+        pop     af
+        ret
 print_hex16_de:
         ld      a,d
         call    print_hex8
@@ -167,20 +206,20 @@ print_string:
         pop     bc
         ret
 
-delay:
+sample_latch_delay:
         push    bc
         push    de
-        ld      b,2
-delay_outer:
-        ld      de,0000h
-delay_inner:
+        ld      b,64
+sample_latch_delay_outer:
+        call    snapshot_keyboard
+        call    latch_snapshot
+        ld      de,0800h
+sample_latch_delay_inner:
         dec     de
         ld      a,d
         or      e
-        ; Keep counting down until the 16-bit inner delay reaches zero.
-        jr      nz,delay_inner
-        ; Repeat the inner countdown to make screen changes easier to observe.
-        djnz    delay_outer
+        jr      nz,sample_latch_delay_inner
+        djnz    sample_latch_delay_outer
         pop     de
         pop     bc
         ret
@@ -191,17 +230,20 @@ cursor_home:
         db      1bh,'H','$'
 title:
         db      'KEYTEST.COM running - physical block 3, 3FF0h-3FFFh',13,10
+        db      'Latched bits sampled during refresh delay',13,10
         db      'Runs continuously - reset the machine to exit',13,10,'$'
 build_timestamp:
         include "build_timestamp.inc"
 
 keyboard_snapshot:
         defs    KEYBOARD_BYTES
+keyboard_latch:
+        defs    KEYBOARD_BYTES
 
         defs    64
 stack_top:
 
         ; Keep the COM image on complete 128-byte CP/M record boundaries.
-        defs    512-($-0100h),0e5h
+        defs    1024-($-0100h),0e5h
 
         end     start
