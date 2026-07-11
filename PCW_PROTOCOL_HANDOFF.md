@@ -2,10 +2,10 @@
 
 ## Project Context
 
-- Active firmware: `D:\PCW\Projects\AmstradPCWKeyboard\PCW8256_PS2_Keyboard_Emulator\PCW8256_PS2_Keyboard_Emulator.ino`
+- Active firmware: `D:\PCW\projects\AmstradPCWKeyboard\PCW8256_PS2_Keyboard_Emulator\PCW8256_PS2_Keyboard_Emulator.ino`
 - Target: Arduino Nano emulating the Amstrad PCW keyboard controller.
 - Purpose: Read PS/2 keyboard events, maintain a PCW keyboard matrix, and repeatedly transmit complete PCW keyboard state frames over the PCW keyboard `CLK` and `DATA` lines.
-- Electrical model: PCW `CLK` and `DATA` are treated as open-collector style lines. The Arduino releases lines high using `INPUT_PULLUP` and actively drives low only.
+- Electrical model: PCW `CLK` and `DATA` are driven push-pull as `OUTPUT` pins (D3/D5), backed by external 10k pull-ups to +5V. Previously these were open-collector (`INPUT_PULLUP` release + drive-low only); switched to push-pull once the external pull-ups made the internal weak pull-up unnecessary, giving faster/cleaner edges with no contention risk since the Arduino is the sole driver on this point-to-point link.
 
 ## Intended Wire Protocol
 
@@ -40,29 +40,29 @@ Packet order:
 
 Observed/target timing from real PCW keyboard traces:
 
-- Normal `CLK` high/setup: about `12us`
+- Normal `CLK` high: about `12us`
 - Normal `CLK` low: about `21us`
-- Fourth `CLK` pulse of each 12-bit word: about `48us` low
-- Inter-frame idle gap: about `6.25ms`
-- `DATA` should be stable before the falling edge / low phase of `CLK`.
-- `DATA` should not transition at the same instant as `CLK` falls.
+- Once per 12-bit word, the 5th bit's high pulse is skipped entirely (no `CLK` edge), merging that bit's low period into the previous one. Combined low is about `42-45us`, consistent with the `~48us` extended low observed on the real keyboard.
+- Inter-frame idle gap: about `6.25ms`.
+- `DATA` latched by the PCW on the falling edge of `CLK`; the firmware sets each bit's `DATA` during the preceding low period, giving ample setup time.
 
-Current intended phase sequence per normal bit:
+### Polarity / inversion
 
-1. `CLK` is high/released.
-2. Wait `4us` recovery after `CLK` rises.
-3. Set/release `DATA` for the next bit.
-4. Wait `8us` data setup.
-5. Pull `CLK` low.
-6. Hold `CLK` low for `21us`, or `48us` if this is the 4th pulse of a 12-bit word.
-7. Release `CLK` high.
+`PCW_INVERT_CLK` (default `0`) selects physical CLK polarity; `0` makes the measured waveform read `12us` high / `21us` low like the real keyboard on the current rig. **Confirm against real hardware with `KEYTEST.COM`** — if keys misread, flip `PCW_INVERT_CLK`.
+
+Two-phase bit sequence (each phase toggles `CLK` as its first action; intervals timed off the Timer1 CTC compare match so pulse widths don't carry ISR work):
+
+1. `RaiseClock`: raise the D6 mirror; raise the real CLK (D3) too **unless** this is the skip bit; hold `PCW_CLOCK_HIGH_US` (~12us).
+2. `LowerClock`: drive both CLKs low (PCW latches this bit's `DATA` on D3's edge), advance to the next bit and load its `DATA`, hold `PCW_CLOCK_LOW_US` (~21us).
+
+The skip bit omits **D3's** rising edge only, so D3 stays low across it (extended low ~54us: 21 + 12 + 21). The **D6 mirror pulses on every bit** as a uniform no-skip reference for scope comparison. Extended-low duration is ~54us vs the real keyboard's ~48us — tune if `KEYTEST` shows the PCW cares.
 
 ## Current Firmware Implementation
 
 Implemented so far:
 
 - Added compile-time serial build banner using `__DATE__` and `__TIME__`.
-- Switched PCW `CLK` and `DATA` handling from push-pull output to open-collector simulation.
+- PCW `CLK`/`DATA` are push-pull `OUTPUT` pins (D3/D5) backed by external 10k pull-ups; briefly went through an open-collector (`INPUT_PULLUP` + drive-low) phase before switching back once the pull-ups made that unnecessary.
 - Reworked Timer1 from a fast tick-counter ISR to edge-scheduled compare intervals.
 - Added explicit `6.25ms` inter-frame gap.
 - Fixed large random frame delays by resetting `TCNT1` before setting `OCR1A` in `scheduleTimer1Us()`.
@@ -76,35 +76,34 @@ Implemented so far:
 Important current timing constants:
 
 - `PCW_CLOCK_HIGH_US = 12`
-- `PCW_CLOCK_RECOVERY_US = 4`
-- `PCW_DATA_SETUP_US = 8`
 - `PCW_CLOCK_LOW_US = 21`
-- `PCW_FOURTH_CLOCK_LOW_US = 48`
+- `PCW_WORD_SKIP_BIT_INDEX = 4` (0-indexed 5th bit of each word; its high pulse is skipped)
 - `PCW_FRAME_GAP_US = 6250`
+- `PCW_INVERT_CLK = 1` (drive physical CLK inverted; see Polarity note above)
 
-## Current Observed Behaviour
+## Current Observed Behaviour / open items
 
-- Frame gap now looks correct at about `6.25ms`.
-- Clock/data glitch appears fixed after separating `DATA` transition from `CLK` rising edge.
-- The intended longer 4th `CLK` low pulse is still not visible in the latest analyser trace.
+- Frame gap looks correct at about `6.25ms`.
+- Root cause of the persistent width jitter identified: the old ISR used 3 entries per bit and toggled the pin *after* counter work, so every pulse carried variable ISR/interrupt latency (Timer0's `millis()` tick every ~1.024ms being the always-on offender). Rewritten to the two-phase toggle-first ISR below; `DIAG_DISABLE_TIMER0_IRQ` added to remove the `millis()` tick during transmission.
+- CLK polarity was inverted vs the real keyboard; addressed with `PCW_INVERT_CLK` (verify with `KEYTEST.COM`).
 
-## Current Suspect
+## State Machine
 
-The code currently attempts to latch the 4th-pulse low duration using `txBitInWord == 3`, but the hardware trace still shows normal low pulses. The next debugging step should verify whether the firmware believes it is scheduling the fourth pulse.
+Firmware models the transmitter as `TxPhase` (`FrameGap`, `RaiseClock`, `LowerClock`):
 
-Recommended next debug step:
+- `FrameGap`: lines held idle. Used before the first frame and during the inter-frame gap. Its timer firing starts a fresh bit via `startCurrentPcwBit()` (sets DATA, raises CLK).
+- `RaiseClock`: drives `CLK` high (first action), holds `PCW_CLOCK_HIGH_US`, → `LowerClock`.
+- `LowerClock`: drives `CLK` low (first action — PCW latches this bit's DATA), advances bit/word counters, ends the frame if complete, else loads the next bit's DATA and holds `PCW_CLOCK_LOW_US`. If the upcoming bit is `PCW_WORD_SKIP_BIT_INDEX`, stays in `LowerClock` (omits its rising edge) to merge the two lows.
 
-- Add a temporary diagnostic output on a spare Arduino pin.
-- Toggle/assert that pin only when the firmware schedules `PCW_FOURTH_CLOCK_LOW_US`.
-- Capture diagnostic pin, `PCW_CLK`, and `PCW_DATA` together.
-- If the diagnostic pin asserts but `CLK` low is not long, the issue is timer scheduling.
-- If the diagnostic pin never asserts, the issue is bit/word position tracking.
+## Diagnostic build flags
+
+Set exactly one run mode (`DIAG_PCW_OUTPUT_ONLY` / `DIAG_PS2_ONLY` / `DIAG_FULL_EMULATOR`), OR `DIAG_CLK_TIMING_TEST` alone (standalone busy-loop bypass; a compile guard now enforces this). Modifiers: `DIAG_DISABLE_WORD_SKIP` (plain square wave, no merge), `DIAG_FORCE_DATA_LOW` (freeze DATA), `DIAG_DISABLE_TIMER0_IRQ` (kill `millis()` tick), `PCW_INVERT_CLK` (physical CLK polarity).
 
 ## Important Code Areas
 
 - Timing constants:
-  - `D:\PCW\Projects\AmstradPCWKeyboard\PCW8256_PS2_Keyboard_Emulator\PCW8256_PS2_Keyboard_Emulator.ino`
-- Open-collector pin helpers:
+  - `D:\PCW\projects\AmstradPCWKeyboard\PCW8256_PS2_Keyboard_Emulator\PCW8256_PS2_Keyboard_Emulator.ino`
+- Push-pull pin helpers:
   - `pcwClockHigh()`
   - `pcwClockLow()`
   - `pcwDataHigh()`
@@ -119,8 +118,8 @@ Recommended next debug step:
 
 ## Validation State
 
-- Latest firmware compile passed after the current timing work.
-- Latest reported compile size:
-  - Flash: about `6830 bytes`
-  - SRAM: about `870 bytes`
+- **Bench waveform confirmed good** (analyser, `DIAG_PCW_OUTPUT_ONLY`, 2026-07-11): polarity correct, ~12us high / ~21us low, no jitter, D3 shows the ~54us merged low once per word while the D6 mirror stays a uniform no-skip clock.
+- **Still to verify on real hardware:** run `KEYTEST.COM` on an actual PCW in `DIAG_FULL_EMULATOR` mode to confirm keys read correctly. Two things that only real hardware can settle:
+  - `PCW_INVERT_CLK` polarity (currently `0`) — flip if keys misread.
+  - Extended-low width is ~54us vs the real keyboard's ~48us — tune only if the PCW proves sensitive to it.
 

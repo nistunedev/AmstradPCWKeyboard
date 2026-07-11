@@ -23,87 +23,166 @@
 // Pinout:
 // PS/2 keyboard CLK  -> D2
 // PS/2 keyboard DATA -> D4
-// PCW keyboard CLK   -> D3, open-collector style, released with INPUT_PULLUP
-// PCW keyboard DATA  -> D5, open-collector style, released with INPUT_PULLUP
+// PCW keyboard CLK   -> D3, push-pull OUTPUT, backed by an external 10k pull-up
+// PCW keyboard DATA  -> D5, push-pull OUTPUT, backed by an external 10k pull-up
 // Common GND
 //
 // The PCW +5V keyboard rail may be able to power both the Nano and the PS/2
 // keyboard, but measure the available current and the keyboard's inrush/current
 // draw before relying on that supply path.
 
-#define PCW_DEBUG 1
-#define DIAG_PCW_OUTPUT_ONLY 0
+#define DIAG_PCW_OUTPUT_ONLY 1
 #define DIAG_PS2_ONLY        0
-#define DIAG_FULL_EMULATOR   1
+#define DIAG_FULL_EMULATOR   0
+// Bypasses Timer1/the ISR entirely and just busy-loops CLK low 21us / high
+// 12us via delayMicroseconds(). Enable this alone (set the others to 0) to
+// check whether basic 21/12us timing holds on this board, decoupled from
+// the ISR state machine, when chasing a timing discrepancy.
+#define DIAG_CLK_TIMING_TEST  0
+// Forces the ISR's word skip-bit merge (PCW_WORD_SKIP_BIT_INDEX) off, so
+// the real Timer1/ISR state machine alternates a plain 21us-low/12us-high
+// square wave with no merged pulse. Use with DIAG_FULL_EMULATOR or
+// DIAG_PCW_OUTPUT_ONLY to test whether the actual interrupt-driven timing
+// mechanism is correct, decoupled from the skip logic specifically.
+#define DIAG_DISABLE_WORD_SKIP 0
+// Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
+// DATA never toggles. Use to test whether CLK timing irregularities are
+// correlated with DATA transitions (e.g. simultaneous-switching noise
+// between adjacent PORTD pins) rather than the CLK state machine itself.
+#define DIAG_FORCE_DATA_LOW 0
+// Disables Timer0's overflow interrupt in setup(), silencing the Arduino
+// millis()/micros() tick that otherwise fires every ~1.024ms and preempts
+// the Timer1 CLK ISR. With the CTC-based scheduler this no longer stretches
+// pulse widths (interval is timed from the hardware compare match, not the
+// ISR), but it can still delay a CLK edge by the tick ISR's run time; leave
+// enabled for the tightest edges. NOTE: this stops millis()/micros()/delay()
+// advancing (the DIAG_PCW_OUTPUT_ONLY heartbeat just won't print);
+// delayMicroseconds() still works as it is a busy-loop.
+#define DIAG_DISABLE_TIMER0_IRQ 1
 
 namespace
 {
-constexpr uint8_t PS2_CLK_PIN = 2;
-constexpr uint8_t PS2_DATA_PIN = 4;
-constexpr uint8_t PCW_CLK_PIN = 3;
-constexpr uint8_t PCW_DATA_PIN = 5;
+constexpr uint8_t PS2_CLK_PIN = 2;   // PS/2 keyboard clock input
+constexpr uint8_t PS2_DATA_PIN = 4;  // PS/2 keyboard data input
+constexpr uint8_t PCW_CLK_PIN = 3;   // PCW keyboard CLK output (push-pull)
+constexpr uint8_t PCW_DATA_PIN = 5;  // PCW keyboard DATA output (push-pull)
 
-#if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 1
-#error Exactly one diagnostic mode must be enabled.
+// Diagnostic-only pin (D6/PD6): mirrors exactly what the firmware believes
+// it is doing to PCW_CLK_PIN, on its own direct output with no external
+// resistor network. Probe it alongside PCW_CLK_PIN to tell a firmware
+// timing bug (both traces wrong) from a D3-specific hardware/probing issue
+// (this trace right, PCW_CLK_PIN still wrong).
+constexpr uint8_t DIAG_CLK_MIRROR_PIN = 6;  // diagnostic-only CLK echo, no external wiring
+
+// DIAG_CLK_TIMING_TEST is a standalone busy-loop bypass: it drives CLK from
+// loop() itself, so it must NOT be combined with any mode that also arms the
+// Timer1 ISR (which would then drive the same CLK pin — two writers, garbage
+// timing). Otherwise, exactly one of the three run modes must be selected.
+#if DIAG_CLK_TIMING_TEST
+  #if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 0
+  #error DIAG_CLK_TIMING_TEST is a standalone bypass; set the other DIAG_* modes to 0.
+  #endif
+#else
+  #if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 1
+  #error Exactly one diagnostic mode must be enabled.
+  #endif
 #endif
 
-constexpr uint8_t PCW_FRAME_WORDS = 17;
-constexpr uint8_t PCW_FRAME_BITS = PCW_FRAME_WORDS * 12;
-constexpr uint8_t PCW_WORD_OFFSET_FLAG = 0x0F;
-constexpr uint8_t PCW_WORD_OFFSET_LINK_STATUS = 0x0D;
-constexpr uint8_t PCW_WORD_OFFSET_OPTION_LINKS = 0x0E;
-constexpr uint8_t PCW_WORD_FLAG_TRANSMITTING = 0x80;
-constexpr uint8_t PCW_WORD_FLAG_UPDATE_TOGGLE = 0x40;
-constexpr uint8_t PCW_SHIFT_LOCK_LED_FLAG = 0x40;
-constexpr uint8_t PCW_INVALID_OFFSET = 0xFF;
-constexpr uint8_t PCW_IDLE_BYTE = 0x00;
+constexpr uint8_t PCW_STATE_BYTES = 16;  // pcwState[] size: one byte per memory-map offset (0x0..0xF)
+constexpr uint8_t PCW_FRAME_WORDS = 17;  // 12-bit words per keyboard frame
+constexpr uint8_t PCW_BITS_PER_WORD = 12;  // 4-bit offset + 8-bit value
+constexpr uint8_t PCW_WORD_VALUE_BITS = 8;  // width of a word's value field, i.e. the offset field's left shift
+constexpr uint8_t PCW_FRAME_BITS = PCW_FRAME_WORDS * PCW_BITS_PER_WORD;  // total bits per frame
+constexpr uint8_t PCW_WORD_OFFSET_FLAG = 0x0F;  // memory-map offset of the transmit/status flag word
+constexpr uint8_t PCW_WORD_OFFSET_LINK_STATUS = 0x0D;  // memory-map offset of the link/status byte
+constexpr uint8_t PCW_WORD_OFFSET_LAST_DATA = PCW_WORD_OFFSET_FLAG - 1U;  // last plain-data offset before the flag word
+constexpr uint8_t PCW_WORD_OFFSET_OPTION_LINKS = 0x0E;  // memory-map offset of the option-links byte
+constexpr uint8_t PCW_WORD_FLAG_TRANSMITTING = 0x80;  // flag-word bit set while a frame is actively transmitting
+constexpr uint8_t PCW_WORD_FLAG_UPDATE_TOGGLE = 0x40;  // flag-word bit that flips every frame to signal new data
 
-// PCW timing follows the observed 8048 keyboard waveform:
-// clock high/setup is about 12 us, clock low is about 21 us, and the fourth
-// clock pulse of each 12-bit word has a longer about 48 us low period.
-constexpr uint16_t TIMER1_PRESCALER = 8;
-constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;
-constexpr uint8_t PCW_CLOCK_HIGH_US = 12;
-constexpr uint8_t PCW_CLOCK_RECOVERY_US = 4;
-constexpr uint8_t PCW_DATA_SETUP_US = PCW_CLOCK_HIGH_US - PCW_CLOCK_RECOVERY_US;
-constexpr uint8_t PCW_CLOCK_LOW_US = 21;
-constexpr uint8_t PCW_FOURTH_CLOCK_LOW_US = 48;
-constexpr uint16_t PCW_FRAME_GAP_US = 6250;
-constexpr uint16_t PCW_FRAME_IDLE_US = PCW_FRAME_GAP_US - PCW_CLOCK_HIGH_US;
-constexpr char BUILD_DATE[] = __DATE__;
-constexpr char BUILD_TIME[] = __TIME__;
-#ifdef PCW_DEBUG
-constexpr bool kDebugEnabled = true;
-#else
-constexpr bool kDebugEnabled = false;
-#endif
+// sendPcwWord() serializes each word MSB-first: word bit 11 down to bit 0
+// map to array indices 0..11 (index = PCW_BITS_PER_WORD - 1 - wordBit).
+// PCW_WORD_FLAG_UPDATE_TOGGLE is word bit 6 (0x40), so it lands at array
+// index 11 - 6 = 5. This is where the ISR patches the toggle bit directly
+// into an already-built frame at the frame boundary (see ISR comment).
+constexpr uint8_t PCW_UPDATE_TOGGLE_BIT_INDEX = 5;
+constexpr uint8_t PCW_SHIFT_LOCK_LED_FLAG = 0x40;  // link-status bit driving the Shift Lock LED
+constexpr uint8_t PCW_INVALID_OFFSET = 0xFF;  // sentinel for "no matrix offset"; currently unused
+constexpr uint8_t PCW_IDLE_BYTE = 0x00;  // idle/reset value for a pcwState byte
+constexpr uint8_t PCW_LINK_STATUS_INITIAL = 0x80;  // initial link-status byte: LK1 not fitted
+constexpr uint8_t PCW_FLAG_INITIAL = 0xC0;  // initial flag-word byte before the first frame is built
+constexpr uint8_t PCW_MAX_MATRIX_OFFSET = 0x0F;  // largest valid pcwState offset (4-bit nibble)
+constexpr uint8_t PCW_MAX_MATRIX_BIT = 7;  // largest valid bit index within a matrix byte
+constexpr uint8_t PCW_HOLD_COUNT_MAX = 0xFF;  // saturation cap for holdCount[] entries
+constexpr uint8_t FRAME_BUFFER_TOGGLE_MASK = 0x01;  // XOR mask to flip between the 2 frameBuffers[] slots
 
-#if PCW_DEBUG && !DIAG_PCW_OUTPUT_ONLY && !DIAG_FULL_EMULATOR
-constexpr bool kVerboseKeyDebug = true;
+constexpr uint16_t PS2_CODE_SPACE = 256;  // PS/2 scancodes are 8-bit (0x00-0xFF)
+constexpr uint8_t PS2_HELD_BITMAP_BYTES = PS2_CODE_SPACE / 8;  // ps2Held[] size, 1 bit per code
+constexpr uint8_t PS2_HELD_BYTE_SHIFT = 3;  // code / 8 -> ps2Held[] byte index
+constexpr uint8_t PS2_HELD_BIT_MASK = 0x07;  // code % 8 -> bit position within that byte
+constexpr uint8_t PS2_CODE_NUL = 0x00;  // null/overrun, not a real key
+constexpr uint8_t PS2_CODE_BAT_PASS = 0xAA;  // power-on self-test pass
+constexpr uint8_t PS2_CODE_ACK = 0xFA;  // command acknowledge
+constexpr uint8_t PS2_CODE_RESEND = 0xFE;  // request to resend last byte
+constexpr uint16_t PS2_CODE_MASK = 0x00FFU;  // isolates the scancode byte from the raw PS2KeyAdvanced value
+constexpr uint32_t SERIAL_BAUD_RATE = 115200;  // USB-serial debug console baud rate
+constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY heartbeat print interval
+
+// PCW timing follows the observed 8048 keyboard waveform: per bit the clock
+// is high about 12 us then low about 21 us, and every 12-bit word has its
+// 5th bit's high pulse skipped (no rising edge on the real CLK), merging that
+// bit's low with the neighbouring lows into the extended low seen on the real
+// keyboard. The transmitter ISR uses two phases per bit (raise then lower),
+// toggling the pin as its first action each time, and times each interval
+// off the Timer1 CTC compare match, so pulse widths don't carry the ISR's
+// own work as jitter. The D6 mirror always pulses (no skip) as a reference.
+//
+// If set, the physical CLK pins are driven to the opposite of the logical
+// level (logical "high" phase -> physical low). Determined empirically per
+// rig: 0 makes the measured waveform read 12 us high / 21 us low like the
+// real keyboard on the current setup. Re-check against the real PCW with
+// KEYTEST.COM; flip it if keys misread.
+#define PCW_INVERT_CLK 0
+
+constexpr uint16_t TIMER1_PRESCALER = 8;  // Timer1 clock/8, giving TIMER1_COUNTS_PER_US counts per microsecond
+constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;  // Timer1 ticks per microsecond
+constexpr uint8_t PCW_CLOCK_HIGH_US = 12;  // CLK-high duration per bit
+constexpr uint8_t PCW_CLOCK_LOW_US = 21;  // normal CLK-low duration per bit
+constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // 0-indexed bit whose high pulse is skipped each word
+constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
+constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
+constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
+
+#if DIAG_PS2_ONLY
+constexpr bool kVerboseKeyDebug = true;  // print every PS/2 event and key mapping decision to Serial
 #else
-constexpr bool kVerboseKeyDebug = false;
+constexpr bool kVerboseKeyDebug = false;  // stay quiet on Serial outside DIAG_PS2_ONLY
 #endif
 
 enum PcwKey : uint8_t;
 
+// One entry in the PROGMEM PS/2-scancode-to-PcwKey lookup table.
 struct KeyMapEntry
 {
-  uint16_t ps2Key;
-  PcwKey key;
+  uint16_t ps2Key;  // PS2KeyAdvanced scancode (e.g. PS2_KEY_A)
+  PcwKey key;  // corresponding PCW keyboard key
 };
 
+// One decoded PS/2 key event, produced by readKeyboardEvent().
 struct KeyEvent
 {
-  uint16_t code;
-  bool pressed;
-  bool released;
-  uint16_t raw;
+  uint16_t code;  // scancode with the break flag masked off
+  bool pressed;  // true if this is a make (key-down) event
+  bool released;  // true if this is a break (key-up) event
+  uint16_t raw;  // raw value as returned by PS2KeyAdvanced::read()
 };
 
+// One entry in a PROGMEM keyboard/joystick matrix table: where a PcwKey
+// lives in pcwState (byte offset + bit within that byte).
 struct PcwMatrixEntry
 {
-  uint8_t offset;
-  uint8_t bit;
+  uint8_t offset;  // pcwState[] byte offset (0x0-0xF)
+  uint8_t bit;  // bit index within that byte (0-7)
 };
 
 enum PcwKey : uint8_t
@@ -238,65 +317,87 @@ enum PcwKey : uint8_t
   PCW_KEY_COUNT
 };
 
+// One entry in a PROGMEM keyboard/joystick matrix table.
 struct PcwKeyMatrixEntry
 {
-  PcwKey key;
-  PcwMatrixEntry matrix;
+  PcwKey key;  // the PCW key this row represents
+  PcwMatrixEntry matrix;  // where that key's bit lives in pcwState
 };
 
-volatile uint8_t pcwState[16];
-uint8_t ps2Held[32];
-uint8_t holdCount[PCW_KEY_COUNT];
-volatile bool frameDirty = false;
+// Transmitter bit-clock state machine, driven one step per call of
+// ISR(TIMER1_COMPA_vect). Two phases per bit, each toggling CLK as its very
+// first action: RaiseClock drives CLK high for PCW_CLOCK_HIGH_US, LowerClock
+// drives CLK low for PCW_CLOCK_LOW_US (latching that bit's DATA on the
+// falling edge) then advances to the next bit. FrameGap holds the lines idle
+// during the inter-frame gap; its timer firing starts the first bit of a
+// fresh frame. The per-word skip bit is handled inside LowerClock by staying
+// low for an extra bit period instead of raising the clock.
+enum class TxPhase : uint8_t
+{
+  FrameGap = 0,
+  RaiseClock = 1,
+  LowerClock = 2
+};
 
-volatile uint8_t activeFrameIndex = 0;
-volatile uint8_t pendingFrameIndex = 0;
-volatile bool pendingFrameReady = false;
-volatile bool pcwUpdateToggle = false;
-volatile uint16_t txBitIndex = 0;
-volatile uint8_t txBitInWord = 0;
-volatile uint8_t txCurrentClockLowUs = PCW_CLOCK_LOW_US;
-volatile uint8_t txPhase = 0;
+volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per memory-map offset
+uint8_t ps2Held[PS2_HELD_BITMAP_BYTES];  // bitmap of PS/2 scancodes currently held (make seen, no break yet)
+uint8_t holdCount[PCW_KEY_COUNT];  // per-PcwKey ref count of PS/2 codes mapped to it, for overlap-safe release
+volatile bool frameDirty = false;  // true when pcwState changed since the last frame was built
 
-uint8_t frameBuffers[2][PCW_FRAME_BITS];
-uint16_t frameLengths[2] = {0, 0};
+volatile uint8_t activeFrameIndex = 0;  // index (0 or 1) of frameBuffers[] currently being transmitted
+volatile uint8_t pendingFrameIndex = 0;  // index of a freshly built frame waiting to become active
+volatile bool pendingFrameReady = false;  // true when pendingFrameIndex holds a frame ready to swap in
+volatile bool pcwUpdateToggle = false;  // flips every transmitted frame so the PCW can detect new vs repeat
+volatile uint16_t txBitIndex = 0;  // index of the next bit to transmit within the active frame buffer
+volatile uint8_t txBitInWord = 0;  // position (0-11) within the current 12-bit word being transmitted
+volatile TxPhase txPhase = TxPhase::FrameGap;  // current state of the transmitter's ISR-driven bit clock
 
-uint8_t buildFrameIndex = 0;
-uint16_t buildBitCount = 0;
+uint8_t frameBuffers[2][PCW_FRAME_BITS];  // double-buffered serialized frame bits, one byte (0/1) per bit
+uint16_t frameLengths[2] = {0, 0};  // bit length of each frameBuffers[] slot; 0 means "not yet built"
 
-PS2KeyAdvanced keyboard;
+uint8_t buildFrameIndex = 0;  // index of the frameBuffers[] slot currently being constructed
+uint16_t buildBitCount = 0;  // number of bits written so far into the frame being built
 
+PS2KeyAdvanced keyboard;  // PS/2 driver instance for the physical keyboard
+
+// Converts a 1-based matrix table row into its zero-based pcwState offset.
 constexpr uint8_t pcwOffsetFromRow(uint8_t row)
 {
   return static_cast<uint8_t>(row - 1U);
 }
 
+// Converts a 1-based matrix table column into its zero-based bit index.
 constexpr uint8_t pcwBitFromColumn(uint8_t column)
 {
   return static_cast<uint8_t>(column - 1U);
 }
 
+// Builds the single-bit mask for a zero-based bit index within a byte.
 constexpr uint8_t pcwMaskFromBit(uint8_t bit)
 {
   return static_cast<uint8_t>(1U << bit);
 }
 
+// Builds a matrix entry from the 1-based (row, column) coordinates used in
+// the keyboard/joystick matrix tables below.
 constexpr PcwMatrixEntry makePcwMatrixEntry(uint8_t row, uint8_t column)
 {
   return {pcwOffsetFromRow(row), pcwBitFromColumn(column)};
 }
 
-constexpr uint8_t kPs2HeldBytes = sizeof(ps2Held) / sizeof(ps2Held[0]);
-
+// Returns true if the given PS/2 scancode is currently marked as held down
+// in the ps2Held bitmap.
 bool isPs2Held(uint8_t code)
 {
-  return (ps2Held[code >> 3] & static_cast<uint8_t>(1U << (code & 0x07U))) != 0;
+  return (ps2Held[code >> PS2_HELD_BYTE_SHIFT] &
+          static_cast<uint8_t>(1U << (code & PS2_HELD_BIT_MASK))) != 0;
 }
 
+// Sets or clears the held-down bit for a PS/2 scancode in the ps2Held bitmap.
 void setPs2Held(uint8_t code, bool held)
 {
-  const uint8_t mask = static_cast<uint8_t>(1U << (code & 0x07U));
-  uint8_t &slot = ps2Held[code >> 3];
+  const uint8_t mask = static_cast<uint8_t>(1U << (code & PS2_HELD_BIT_MASK));
+  uint8_t &slot = ps2Held[code >> PS2_HELD_BYTE_SHIFT];
   if (held)
   {
     slot |= mask;
@@ -307,14 +408,16 @@ void setPs2Held(uint8_t code, bool held)
   }
 }
 
+// Returns true for PS/2 codes that are not real keys (nulls, ACK, resend,
+// self-test-pass) and should be dropped before matching against the map.
 bool isIgnoredPs2Code(uint8_t code)
 {
   switch (code)
   {
-    case 0x00:
-    case 0xAA:
-    case 0xFA:
-    case 0xFE:
+    case PS2_CODE_NUL:
+    case PS2_CODE_BAT_PASS:
+    case PS2_CODE_ACK:
+    case PS2_CODE_RESEND:
       return true;
 
     default:
@@ -322,39 +425,84 @@ bool isIgnoredPs2Code(uint8_t code)
   }
 }
 
+// Drives the real PCW CLK (D3) to its logical-high state (the bit's 12 us
+// high phase). Push-pull OUTPUT backed by an external 10k pull-up. When
+// PCW_INVERT_CLK is set the physical pin is driven LOW here so the path to
+// the PCW presents a high — see PCW_INVERT_CLK above.
 inline void pcwClockHigh()
 {
-  DDRD &= static_cast<uint8_t>(~_BV(PD3));
+#if PCW_INVERT_CLK
+  PORTD &= static_cast<uint8_t>(~_BV(PD3));
+#else
   PORTD |= _BV(PD3);
+#endif
 }
 
+// Drives the real PCW CLK (D3) to its logical-low state (the bit's 21 us
+// low phase).
 inline void pcwClockLow()
 {
+#if PCW_INVERT_CLK
+  PORTD |= _BV(PD3);
+#else
   PORTD &= static_cast<uint8_t>(~_BV(PD3));
-  DDRD |= _BV(PD3);
+#endif
 }
 
+// Drives the diagnostic CLK mirror (D6) high/low. D6 shows the clock WITHOUT
+// the per-word skip applied — a uniform reference every bit — so it can be
+// compared on the scope against the real D3 CLK, which does skip. Uses the
+// same PCW_INVERT_CLK polarity as D3 so the two read alike on the analyser.
+inline void diagClockHigh()
+{
+#if PCW_INVERT_CLK
+  PORTD &= static_cast<uint8_t>(~_BV(PD6));
+#else
+  PORTD |= _BV(PD6);
+#endif
+}
+
+inline void diagClockLow()
+{
+#if PCW_INVERT_CLK
+  PORTD |= _BV(PD6);
+#else
+  PORTD &= static_cast<uint8_t>(~_BV(PD6));
+#endif
+}
+
+// Drives PCW DATA (D5) high. D5 is a push-pull OUTPUT; the external 10k
+// pull-up backs it up but is no longer relied on for the high state.
 inline void pcwDataHigh()
 {
-  DDRD &= static_cast<uint8_t>(~_BV(PD5));
   PORTD |= _BV(PD5);
 }
 
+// Drives PCW DATA (D5) low.
 inline void pcwDataLow()
 {
   PORTD &= static_cast<uint8_t>(~_BV(PD5));
-  DDRD |= _BV(PD5);
 }
 
+// Sets the length of the NEXT Timer1 interval by writing OCR1A only. In CTC
+// mode the hardware clears TCNT1 to 0 at each compare match, so the interval
+// is measured from that match — NOT from when this runs inside the ISR. That
+// keeps pulse widths exact regardless of how much work the ISR does before
+// calling this (unlike zeroing TCNT1 here, which folded the ISR's own run
+// time into the interval and stretched every low period). Safe because every
+// interval used here (>= PCW_CLOCK_HIGH_US = 24 ticks) is far larger than the
+// ISR-entry latency, so the new OCR1A is never already behind TCNT1.
 inline void scheduleTimer1Us(uint16_t microseconds)
 {
-  TCNT1 = 0;
   OCR1A = static_cast<uint16_t>((microseconds * TIMER1_COUNTS_PER_US) - 1U);
 }
 
+// Resets the PCW state buffer, key hold counters, and PS/2 held-key bitmap
+// to their idle values, and seeds the link/status bytes for the target
+// keyboard's fitted-link configuration.
 void initializePcwState()
 {
-  for (uint8_t i = 0; i < 16; ++i)
+  for (uint8_t i = 0; i < PCW_STATE_BYTES; ++i)
   {
     pcwState[i] = PCW_IDLE_BYTE;
   }
@@ -364,15 +512,15 @@ void initializePcwState()
     holdCount[i] = 0;
   }
 
-  for (uint8_t i = 0; i < kPs2HeldBytes; ++i)
+  for (uint8_t i = 0; i < PS2_HELD_BITMAP_BYTES; ++i)
   {
     ps2Held[i] = false;
   }
 
   // The target keyboard has LK1, LK2, and LK3 not fitted.
-  pcwState[PCW_WORD_OFFSET_LINK_STATUS] = 0x80;
-  pcwState[PCW_WORD_OFFSET_OPTION_LINKS] = 0x00;
-  pcwState[PCW_WORD_OFFSET_FLAG] = 0xC0;
+  pcwState[PCW_WORD_OFFSET_LINK_STATUS] = PCW_LINK_STATUS_INITIAL;
+  pcwState[PCW_WORD_OFFSET_OPTION_LINKS] = PCW_IDLE_BYTE;
+  pcwState[PCW_WORD_OFFSET_FLAG] = PCW_FLAG_INITIAL;
   pcwUpdateToggle = true;
   frameDirty = true;
 }
@@ -612,6 +760,8 @@ constexpr uint16_t kPcwKeyboardMatrixCount = sizeof(kPcwKeyboardMatrix) / sizeof
 constexpr uint16_t kPcwJoystickMatrixCount = sizeof(kPcwJoystickMatrix) / sizeof(kPcwJoystickMatrix[0]);
 constexpr uint16_t kKeyMapCount = sizeof(kKeyMap) / sizeof(kKeyMap[0]);
 
+// Looks up a PS/2 scancode in the PROGMEM key map. Returns true and fills
+// result on a match.
 bool findKeyMapEntry(uint16_t ps2Key, KeyMapEntry &result)
 {
   for (uint16_t i = 0; i < kKeyMapCount; ++i)
@@ -627,6 +777,8 @@ bool findKeyMapEntry(uint16_t ps2Key, KeyMapEntry &result)
   return false;
 }
 
+// Looks up a PcwKey in a PROGMEM matrix table (keyboard or joystick).
+// Returns true and fills result on a match.
 bool findMatrixEntry(const PcwKeyMatrixEntry *table, uint16_t count, PcwKey key, PcwMatrixEntry &result)
 {
   for (uint16_t i = 0; i < count; ++i)
@@ -642,18 +794,25 @@ bool findMatrixEntry(const PcwKeyMatrixEntry *table, uint16_t count, PcwKey key,
   return false;
 }
 
+// Looks up a PcwKey in the main keyboard matrix table.
 bool findKeyboardMatrixEntry(PcwKey key, PcwMatrixEntry &result)
 {
   return findMatrixEntry(kPcwKeyboardMatrix, kPcwKeyboardMatrixCount, key, result);
 }
 
+// Looks up a PcwKey in the joystick matrix table.
 bool findJoystickMatrixEntry(PcwKey key, PcwMatrixEntry &result)
 {
   return findMatrixEntry(kPcwJoystickMatrix, kPcwJoystickMatrixCount, key, result);
 }
 
+// Drives PCW DATA to the value of the bit currently pointed to by
+// txBitIndex in the active frame buffer.
 void loadCurrentPcwData()
 {
+#if DIAG_FORCE_DATA_LOW
+  pcwDataLow();
+#else
   const uint8_t bitValue = frameBuffers[activeFrameIndex][txBitIndex];
   if (bitValue)
   {
@@ -663,24 +822,29 @@ void loadCurrentPcwData()
   {
     pcwDataLow();
   }
+#endif
 }
 
+// Entry point for the first bit of a frame (from TxPhase::FrameGap): sets
+// that bit's DATA, raises CLK to begin its high phase, and hands off to
+// LowerClock which will drop CLK (latching the bit) after PCW_CLOCK_HIGH_US.
 void startCurrentPcwBit()
 {
   loadCurrentPcwData();
-  txCurrentClockLowUs =
-      (txBitInWord == 3U) ? PCW_FOURTH_CLOCK_LOW_US : PCW_CLOCK_LOW_US;
-  pcwClockHigh();
+  pcwClockHigh();   // real CLK (D3)
+  diagClockHigh();  // mirror (D6) — bit 0 is never the skip bit
   scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-  txPhase = 1;
+  txPhase = TxPhase::LowerClock;
 }
 
+// Starts building the next frame into the inactive frame buffer slot.
 void beginFrameBuild()
 {
-  buildFrameIndex = activeFrameIndex ^ 0x01;
+  buildFrameIndex = activeFrameIndex ^ FRAME_BUFFER_TOGGLE_MASK;
   buildBitCount = 0;
 }
 
+// Appends one bit (as a 0/1 byte) to the frame buffer currently being built.
 void appendBit(bool high)
 {
   if (buildBitCount < PCW_FRAME_BITS)
@@ -689,15 +853,22 @@ void appendBit(bool high)
   }
 }
 
+// Appends a 12-bit word (4-bit offset, 8-bit value), MSB first, to the
+// frame buffer currently being built.
 void sendPcwWord(uint8_t offset, uint8_t value)
 {
-  const uint16_t word = (static_cast<uint16_t>(offset & 0x0F) << 8) | value;
-  for (int8_t bit = 11; bit >= 0; --bit)
+  const uint16_t word = (static_cast<uint16_t>(offset & PCW_MAX_MATRIX_OFFSET) << PCW_WORD_VALUE_BITS) | value;
+  for (int8_t bit = PCW_BITS_PER_WORD - 1; bit >= 0; --bit)
   {
     appendBit((word >> bit) & 0x01U);
   }
 }
 
+// Builds a new 17-word frame from the current pcwState snapshot, if the
+// state has changed and no built frame is already waiting to go active.
+// The freshly built frame becomes active immediately if the transmitter is
+// idle, otherwise it's queued as the pending frame and swapped in by the
+// ISR at the next frame boundary.
 void sendPcwFrame()
 {
   noInterrupts();
@@ -708,11 +879,11 @@ void sendPcwFrame()
     return;
   }
 
-  uint8_t snapshot[16];
+  uint8_t snapshot[PCW_STATE_BYTES];
   bool updateToggle;
 
   noInterrupts();
-  for (uint8_t i = 0; i < 16; ++i)
+  for (uint8_t i = 0; i < PCW_STATE_BYTES; ++i)
   {
     snapshot[i] = pcwState[i];
   }
@@ -728,7 +899,7 @@ void sendPcwFrame()
   sendPcwWord(PCW_WORD_OFFSET_FLAG,
               static_cast<uint8_t>(flagValue |
                                    PCW_WORD_FLAG_TRANSMITTING));
-  for (uint8_t offset = 0; offset <= 0x0E; ++offset)
+  for (uint8_t offset = 0; offset <= PCW_WORD_OFFSET_LAST_DATA; ++offset)
   {
     sendPcwWord(offset, snapshot[offset]);
   }
@@ -741,7 +912,7 @@ void sendPcwFrame()
     activeFrameIndex = buildFrameIndex;
     txBitIndex = 0;
     txBitInWord = 0;
-    txPhase = 0;
+    txPhase = TxPhase::FrameGap;
   }
   else
   {
@@ -752,9 +923,13 @@ void sendPcwFrame()
   interrupts();
 }
 
+// Returns the name of whichever DIAG_* mode is compiled in, for the startup
+// serial banner.
 const __FlashStringHelper *activeDiagnosticModeName()
 {
-  #if DIAG_PCW_OUTPUT_ONLY
+  #if DIAG_CLK_TIMING_TEST
+  return F("DIAG_CLK_TIMING_TEST");
+  #elif DIAG_PCW_OUTPUT_ONLY
   return F("DIAG_PCW_OUTPUT_ONLY");
   #elif DIAG_PS2_ONLY
   return F("DIAG_PS2_ONLY");
@@ -763,6 +938,8 @@ const __FlashStringHelper *activeDiagnosticModeName()
   #endif
 }
 
+// Sets or clears the matrix bit for a PcwKey (keyboard or joystick) in
+// pcwState and marks the frame dirty so the next sendPcwFrame() picks it up.
 void applyKeyState(PcwKey key, bool pressed)
 {
   PcwMatrixEntry matrixEntry;
@@ -779,7 +956,7 @@ void applyKeyState(PcwKey key, bool pressed)
     }
   }
 
-  if (matrixEntry.offset > 0x0F || matrixEntry.bit > 7)
+  if (matrixEntry.offset > PCW_MAX_MATRIX_OFFSET || matrixEntry.bit > PCW_MAX_MATRIX_BIT)
   {
     if (kVerboseKeyDebug)
     {
@@ -819,15 +996,17 @@ void applyKeyState(PcwKey key, bool pressed)
   }
 }
 
-// This wrapper keeps PS/2 library details in one place so we can later swap
-// the keyboard source for USB, serial test input, or a different library
-// without changing the PCW state array or the transmitter logic.
+// Reads the next non-ignored PS/2 key event into event, if one is available.
+// Returns false once the PS/2 library's queue is empty. This wrapper keeps
+// PS/2 library details in one place so we can later swap the keyboard
+// source for USB, serial test input, or a different library without
+// changing the PCW state array or the transmitter logic.
 bool readKeyboardEvent(KeyEvent &event)
 {
   while (keyboard.available())
   {
     event.raw = keyboard.read();
-    event.code = event.raw & 0x00FFU;
+    event.code = event.raw & PS2_CODE_MASK;
     event.released = (event.raw & PS2_BREAK) != 0;
     event.pressed = !event.released;
 
@@ -847,6 +1026,11 @@ bool readKeyboardEvent(KeyEvent &event)
   return false;
 }
 
+// Applies one PS/2 key event to the PCW state: handles typematic-repeat
+// suppression, Shift/Shift Lock interaction, maps the PS/2 code to a PcwKey
+// via kKeyMap, and applies make/break through applyKeyState() with hold
+// counting so overlapping PS/2 codes mapped to the same PcwKey don't
+// release it early.
 void updatePcwState(const KeyEvent &event)
 {
   if (kVerboseKeyDebug)
@@ -866,7 +1050,7 @@ void updatePcwState(const KeyEvent &event)
     }
   }
 
-  const uint8_t ps2Code = static_cast<uint8_t>(event.code & 0x00FFU);
+  const uint8_t ps2Code = static_cast<uint8_t>(event.code & PS2_CODE_MASK);
   if (event.pressed)
   {
     if (isPs2Held(ps2Code))
@@ -927,7 +1111,7 @@ void updatePcwState(const KeyEvent &event)
       applyKeyState(entry.key, true);
     }
 
-    if (holdCount[keyIndex] < 0xFF)
+    if (holdCount[keyIndex] < PCW_HOLD_COUNT_MAX)
     {
       ++holdCount[keyIndex];
     }
@@ -945,6 +1129,8 @@ void updatePcwState(const KeyEvent &event)
   }
 }
 
+// Configures Timer1 in CTC mode (prescaler /8) and arms the first compare
+// match, starting the transmitter's ISR-driven bit clock.
 void setupTimer1()
 {
   cli();
@@ -952,11 +1138,25 @@ void setupTimer1()
   TCCR1B = 0;
   TCCR1B |= _BV(WGM12);
   TCCR1B |= _BV(CS11);
+  TCNT1 = 0;  // one-time clean start; thereafter CTC auto-resets at each match
   scheduleTimer1Us(PCW_CLOCK_HIGH_US);
   TIMSK1 |= _BV(OCIE1A);
   sei();
 }
 
+// Main transmitter state machine, one step per Timer1 compare-match. Two
+// phases per bit, each toggling CLK as its very first instruction so the
+// pulse width never carries the ISR's own work as jitter:
+//   RaiseClock -> CLK high, wait PCW_CLOCK_HIGH_US   (~12us high)
+//   LowerClock -> CLK low (latches this bit's DATA), advance to the next
+//                 bit, load its DATA, wait PCW_CLOCK_LOW_US (~21us low)
+// The per-word skip bit is handled in RaiseClock: on the skip bit the real
+// CLK (D3) rising edge is omitted, so D3 stays low across that bit and its
+// low merges with the neighbouring lows into the extended low seen on the
+// real keyboard. The D6 mirror always pulses (every bit), giving a uniform
+// no-skip reference to compare against D3 on the analyser. FrameGap holds
+// the lines idle during the inter-frame gap; its timer firing starts the
+// first bit of a fresh frame via startCurrentPcwBit().
 ISR(TIMER1_COMPA_vect)
 {
   const uint8_t currentFrame = activeFrameIndex;
@@ -964,33 +1164,50 @@ ISR(TIMER1_COMPA_vect)
 
   if (frameLength == 0)
   {
-    pcwClockHigh();
-    pcwDataHigh();
+    pcwClockLow();
+    diagClockLow();
+    pcwDataLow();
     return;
   }
 
   switch (txPhase)
   {
-    case 0:
+    case TxPhase::FrameGap:
       startCurrentPcwBit();
       break;
 
-    case 1:
-      pcwClockLow();
-      scheduleTimer1Us(txCurrentClockLowUs);
-      txPhase = 2;
+    case TxPhase::RaiseClock:
+      // D6 mirror pulses on every bit; the real CLK (D3) pulses too, except
+      // on the skip bit whose rising edge is omitted (D3 stays low).
+      diagClockHigh();
+      if (DIAG_DISABLE_WORD_SKIP || txBitInWord != PCW_WORD_SKIP_BIT_INDEX)
+      {
+        pcwClockHigh();
+      }
+      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
+      txPhase = TxPhase::LowerClock;
       break;
 
-    case 2:
-      pcwClockHigh();
+    case TxPhase::LowerClock:
+      pcwClockLow();
+      diagClockLow();
       ++txBitIndex;
       ++txBitInWord;
-      if (txBitInWord >= 12U)
+      if (txBitInWord >= PCW_BITS_PER_WORD)
       {
         txBitInWord = 0;
       }
       if (txBitIndex >= frameLength)
       {
+        // Frame complete. The update-toggle bit must flip every frame (even
+        // if key state didn't change) so the PCW can tell "new frame" from
+        // "same frame repeated". It's patched directly into the two words
+        // that carry it (the first and last word of the frame, both offset
+        // 0x0F, per the packet order in PCW_PROTOCOL_HANDOFF.md) rather
+        // than triggering a full rebuild, and it's done here rather than
+        // in loop()'s sendPcwFrame() so it stays synchronized with this
+        // same frame-swap moment — deferring it risks the ISR starting to
+        // transmit the new frame before loop() has updated the toggle bit.
         txBitIndex = 0;
         txBitInWord = 0;
         pcwUpdateToggle = !pcwUpdateToggle;
@@ -1002,41 +1219,39 @@ ISR(TIMER1_COMPA_vect)
 
         const uint8_t nextFrame = activeFrameIndex;
         const uint8_t toggleBit = pcwUpdateToggle ? 1 : 0;
-        frameBuffers[nextFrame][5] = toggleBit;
-        frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * 12U + 5U] =
-            toggleBit;
-        pcwDataHigh();
-        scheduleTimer1Us(PCW_FRAME_IDLE_US);
-        txPhase = 3;
+        frameBuffers[nextFrame][PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+        frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * PCW_BITS_PER_WORD +
+                                 PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+        pcwDataLow();
+        scheduleTimer1Us(PCW_FRAME_GAP_US);
+        txPhase = TxPhase::FrameGap;
         break;
       }
-      scheduleTimer1Us(PCW_CLOCK_RECOVERY_US);
-      txPhase = 4;
-      break;
 
-    case 3:
-      startCurrentPcwBit();
-      break;
-
-    case 4:
       loadCurrentPcwData();
-      scheduleTimer1Us(PCW_DATA_SETUP_US);
-      txPhase = 1;
+      scheduleTimer1Us(PCW_CLOCK_LOW_US);
+      txPhase = TxPhase::RaiseClock;
       break;
 
     default:
-      pcwClockHigh();
-      pcwDataHigh();
+      // Defensive recovery in case txPhase ever holds an unexpected value:
+      // hold both lines low and restart from the beginning of a bit.
+      pcwClockLow();
+      diagClockLow();
+      pcwDataLow();
       scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-      txPhase = 0;
+      txPhase = TxPhase::FrameGap;
       break;
   }
 }
 } // namespace
 
+// Arduino entry point: prints the startup/build banner, configures pins,
+// resets PCW state, and (per the compiled DIAG_* mode) starts the PS/2
+// reader and/or the PCW transmitter's Timer1 ISR.
 void setup()
 {
-  Serial.begin(115200);
+  Serial.begin(SERIAL_BAUD_RATE);
   Serial.println(F("PCW keyboard emulator startup"));
   Serial.print(F("Build: "));
   Serial.print(BUILD_DATE);
@@ -1048,15 +1263,22 @@ void setup()
   pinMode(PS2_CLK_PIN, INPUT_PULLUP);
   pinMode(PS2_DATA_PIN, INPUT_PULLUP);
 
-  pinMode(PCW_CLK_PIN, INPUT_PULLUP);
-  pinMode(PCW_DATA_PIN, INPUT_PULLUP);
-  pcwClockHigh();
-  pcwDataHigh();
+  pinMode(PCW_CLK_PIN, OUTPUT);
+  pinMode(PCW_DATA_PIN, OUTPUT);
+  pinMode(DIAG_CLK_MIRROR_PIN, OUTPUT);
+  pcwClockLow();
+  diagClockLow();
+  pcwDataLow();
 
   initializePcwState();
 
   #if DIAG_PS2_ONLY || DIAG_FULL_EMULATOR
   keyboard.begin(PS2_DATA_PIN, PS2_CLK_PIN);
+  #endif
+
+  #if DIAG_DISABLE_TIMER0_IRQ
+  // Silence the millis()/micros() tick so it cannot preempt the CLK ISR.
+  TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0));
   #endif
 
   #if DIAG_PCW_OUTPUT_ONLY || DIAG_FULL_EMULATOR
@@ -1065,12 +1287,28 @@ void setup()
   #endif
 }
 
+// Arduino main loop. Behaviour depends on the compiled DIAG_* mode:
+// DIAG_CLK_TIMING_TEST busy-loops a bare 21us/12us CLK toggle with no ISR
+// or state machine involved, to isolate basic timing accuracy; DIAG_PCW_OUTPUT_ONLY
+// just keeps the transmitter fed and prints a heartbeat; DIAG_PS2_ONLY dumps
+// raw PS/2 events to serial; DIAG_FULL_EMULATOR drains PS/2 events into PCW
+// state and (re)builds the transmit frame.
 void loop()
 {
+  #if DIAG_CLK_TIMING_TEST
+  pcwClockLow();
+  diagClockLow();
+  delayMicroseconds(PCW_CLOCK_LOW_US);
+  pcwClockHigh();
+  diagClockHigh();
+  delayMicroseconds(PCW_CLOCK_HIGH_US);
+  return;
+  #endif
+
   #if DIAG_PCW_OUTPUT_ONLY
   static uint32_t lastHeartbeatMs = 0;
   sendPcwFrame();
-  if (millis() - lastHeartbeatMs >= 1000UL)
+  if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)
   {
     Serial.println(F("PCW frame transmitter running"));
     lastHeartbeatMs = millis();
