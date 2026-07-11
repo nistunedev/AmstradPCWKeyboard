@@ -39,11 +39,10 @@
 // check whether basic 21/12us timing holds on this board, decoupled from
 // the ISR state machine, when chasing a timing discrepancy.
 #define DIAG_CLK_TIMING_TEST  0
-// Forces the ISR's word skip-bit merge (PCW_WORD_SKIP_BIT_INDEX) off, so
-// the real Timer1/ISR state machine alternates a plain 21us-low/12us-high
-// square wave with no merged pulse. Use with DIAG_FULL_EMULATOR or
-// DIAG_PCW_OUTPUT_ONLY to test whether the actual interrupt-driven timing
-// mechanism is correct, decoupled from the skip logic specifically.
+// When 1, all clock lows are a uniform ~21us (no per-word marker). When 0
+// (normal), all 12 pulses fire but the low after the 4th pulse is stretched
+// to ~48us as the per-word sync marker James measured. Keep 0 for real
+// hardware; set 1 only to test a plain square wave.
 #define DIAG_DISABLE_WORD_SKIP 0
 // Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
 // DATA never toggles. Use to test whether CLK timing irregularities are
@@ -59,6 +58,14 @@
 // library and delay() rely on millis()/micros(), so freezing them can cause
 // missed or stuck keys. (delayMicroseconds() still works — it's a busy-loop.)
 #define DIAG_DISABLE_TIMER0_IRQ 0
+// Milliseconds to hold the lines idle (no clocking, so the PCW sees no keys)
+// at startup BEFORE the transmitter begins. This lets the PCW cold-boot and
+// PROFILE.SUB launch KEYTEST.COM without our frames spamming phantom
+// keypresses that abort the SUBMIT. Power the Arduino and PCW together (or
+// reset the Arduino as you boot the PCW): the Arduino stays silent for this
+// long, KEYTEST comes up, then transmission starts and KEYTEST shows the live
+// decoded bytes. Set 0 to transmit immediately.
+#define STARTUP_IDLE_MS 0UL
 
 namespace
 {
@@ -144,11 +151,36 @@ constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY hear
 // KEYTEST.COM; flip it if keys misread.
 #define PCW_INVERT_CLK 0
 
+// Idle level for CLK/DATA between frames (the ~6.25 ms inter-frame gap) and
+// before the first frame. The PCW hardware notes say a real keyboard rests
+// both lines HIGH when not actively transmitting (they are pulled high on the
+// motherboard; a keyboard only drives them low while sending a frame), and
+// that high/idle lines read as "no keys". Default 1 (idle high) to match.
+// Set 0 to idle low. This is a prime suspect if the PCW cannot frame our
+// output — flip it if the real machine shows garbage.
+#define PCW_IDLE_HIGH 1
+
+// DATA line sense. On the PCW a released/high DATA line reads as bit 0 (an
+// unplugged keyboard, lines high, reads as all-zero / no keys), so a driven
+// LOW is bit 1 — the opposite of the natural "high = 1" mapping. With this
+// set, a logical 1 bit is driven LOW and a logical 0 bit is driven HIGH, so
+// our all-zero idle frame reads as "no keys" on the real machine. Set 0 for
+// the natural mapping (matches the DIAG decode on the analyser). Flip if the
+// PCW reads keys inverted (e.g. floods characters with nothing pressed).
+#define PCW_INVERT_DATA 1
+
 constexpr uint16_t TIMER1_PRESCALER = 8;  // Timer1 clock/8, giving TIMER1_COUNTS_PER_US counts per microsecond
 constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;  // Timer1 ticks per microsecond
 constexpr uint8_t PCW_CLOCK_HIGH_US = 12;  // CLK-high duration per bit
 constexpr uint8_t PCW_CLOCK_LOW_US = 21;  // normal CLK-low duration per bit
-constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // 0-indexed bit whose high pulse is skipped each word
+constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse the old skip omitted
+// All 12 pulses are sent, but the LOW after the 4th pulse (i.e. after bit
+// index 3) is stretched to ~48us — the "48us gap after the fourth clock
+// pulse" James measured. The gate array appears to use this longer low as
+// the per-word sync marker. PCW_WORD_LONG_LOW_BIT is the 0-indexed bit whose
+// following low is extended (bit 3 = the 4th pulse).
+constexpr uint8_t PCW_CLOCK_LONG_LOW_US = 48;  // extended CLK-low after the 4th pulse of each word
+constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // low following this bit's pulse is the long one
 constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
@@ -484,6 +516,21 @@ inline void pcwDataLow()
   PORTD &= static_cast<uint8_t>(~_BV(PD5));
 }
 
+// Drives CLK, the D6 mirror, and DATA to the inter-frame idle level selected
+// by PCW_IDLE_HIGH. Used before the first frame and during the ~6.25 ms gap.
+inline void pcwLinesIdle()
+{
+#if PCW_IDLE_HIGH
+  pcwClockHigh();
+  diagClockHigh();
+  pcwDataHigh();
+#else
+  pcwClockLow();
+  diagClockLow();
+  pcwDataLow();
+#endif
+}
+
 // Sets the length of the NEXT Timer1 interval by writing OCR1A only. In CTC
 // mode the hardware clears TCNT1 to 0 at each compare match, so the interval
 // is measured from that match — NOT from when this runs inside the ISR. That
@@ -813,8 +860,11 @@ void loadCurrentPcwData()
 #if DIAG_FORCE_DATA_LOW
   pcwDataLow();
 #else
-  const uint8_t bitValue = frameBuffers[activeFrameIndex][txBitIndex];
-  if (bitValue)
+  bool high = frameBuffers[activeFrameIndex][txBitIndex] != 0;
+#if PCW_INVERT_DATA
+  high = !high;  // PCW reads a high DATA line as 0, so a 1 bit is driven low
+#endif
+  if (high)
   {
     pcwDataHigh();
   }
@@ -1164,9 +1214,7 @@ ISR(TIMER1_COMPA_vect)
 
   if (frameLength == 0)
   {
-    pcwClockLow();
-    diagClockLow();
-    pcwDataLow();
+    pcwLinesIdle();
     return;
   }
 
@@ -1177,20 +1225,20 @@ ISR(TIMER1_COMPA_vect)
       break;
 
     case TxPhase::RaiseClock:
-      // D6 mirror pulses on every bit; the real CLK (D3) pulses too, except
-      // on the skip bit whose rising edge is omitted (D3 stays low).
+      // Every bit gets a full clock pulse (12 pulses per 12-bit word). The
+      // per-word marker is a longer LOW after the 4th pulse, applied in
+      // LowerClock — not an omitted pulse.
       diagClockHigh();
-      if (DIAG_DISABLE_WORD_SKIP || txBitInWord != PCW_WORD_SKIP_BIT_INDEX)
-      {
-        pcwClockHigh();
-      }
+      pcwClockHigh();
       scheduleTimer1Us(PCW_CLOCK_HIGH_US);
       txPhase = TxPhase::LowerClock;
       break;
 
     case TxPhase::LowerClock:
+    {
       pcwClockLow();
       diagClockLow();
+      const uint8_t justLatched = txBitInWord;  // bit whose falling edge just occurred
       ++txBitIndex;
       ++txBitInWord;
       if (txBitInWord >= PCW_BITS_PER_WORD)
@@ -1222,23 +1270,35 @@ ISR(TIMER1_COMPA_vect)
         frameBuffers[nextFrame][PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
         frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * PCW_BITS_PER_WORD +
                                  PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
-        pcwDataLow();
+        // Release the lines to the idle level for the inter-frame gap. The
+        // last bit was already latched on its falling edge above.
+        pcwLinesIdle();
         scheduleTimer1Us(PCW_FRAME_GAP_US);
         txPhase = TxPhase::FrameGap;
         break;
       }
 
       loadCurrentPcwData();
-      scheduleTimer1Us(PCW_CLOCK_LOW_US);
+      // The low following the 4th pulse (bit 3) is stretched to ~48us as the
+      // per-word sync marker; every other low is the normal ~21us.
+      {
+        uint16_t lowUs = PCW_CLOCK_LOW_US;
+#if !DIAG_DISABLE_WORD_SKIP
+        if (justLatched == PCW_WORD_LONG_LOW_BIT)
+        {
+          lowUs = PCW_CLOCK_LONG_LOW_US;
+        }
+#endif
+        scheduleTimer1Us(lowUs);
+      }
       txPhase = TxPhase::RaiseClock;
       break;
+    }
 
     default:
       // Defensive recovery in case txPhase ever holds an unexpected value:
-      // hold both lines low and restart from the beginning of a bit.
-      pcwClockLow();
-      diagClockLow();
-      pcwDataLow();
+      // hold the lines idle and restart from the beginning of a bit.
+      pcwLinesIdle();
       scheduleTimer1Us(PCW_CLOCK_HIGH_US);
       txPhase = TxPhase::FrameGap;
       break;
@@ -1266,14 +1326,23 @@ void setup()
   pinMode(PCW_CLK_PIN, OUTPUT);
   pinMode(PCW_DATA_PIN, OUTPUT);
   pinMode(DIAG_CLK_MIRROR_PIN, OUTPUT);
-  pcwClockLow();
-  diagClockLow();
-  pcwDataLow();
+  pcwLinesIdle();
 
   initializePcwState();
 
   #if DIAG_PS2_ONLY || DIAG_FULL_EMULATOR
   keyboard.begin(PS2_DATA_PIN, PS2_CLK_PIN);
+  #endif
+
+  #if (DIAG_PCW_OUTPUT_ONLY || DIAG_FULL_EMULATOR) && (STARTUP_IDLE_MS > 0)
+  // Hold the lines idle (set above) so the PCW can boot and KEYTEST can start
+  // before we begin transmitting. delay() needs Timer0, so do this before any
+  // DIAG_DISABLE_TIMER0_IRQ below.
+  Serial.print(F("Holding idle "));
+  Serial.print(STARTUP_IDLE_MS);
+  Serial.println(F(" ms before transmit..."));
+  delay(STARTUP_IDLE_MS);
+  Serial.println(F("Starting PCW transmit."));
   #endif
 
   #if DIAG_DISABLE_TIMER0_IRQ
