@@ -239,7 +239,8 @@ Verifying the circuit diagrams: Confirmed that DATA and CLK signals go into a TC
 
 On the keyboard side, the CLK and DATA lines enter via 470 ohm resistors, which are then pulled up to 5VCC by 4.7K ohm resistors. Internally the PCW has protection diodes to ground on both lines.
 
-![PCW keyboard connector resistors](images/PCW%20keyboard%20connector%20resistors.png)
+<img src="images/PCW%20keyboard%20connector%20resistors.png" alt="PCW keyboard connector resistors" height="500">
+
 
 Emulator wiring (Arduino Nano to the PCW keyboard connector, with series and pull-up resistors):
 
@@ -261,7 +262,7 @@ So long as the clock signal is within certain tolerances I would guess that the 
 To send a bit, the keyboard drives the data line low or high, pulls the clock line low, and then a little later returns them both to high. 
 
 Notes:
-Exact timings are unknown, though the PCW motherboard seems happy to accept timings similar to those used by the PC1512 keyboard (set data, wait for 5µs, set clock, wait for 5µs, return both lines to high, wait for 40µs).
+PCW motherboard seems happy to accept timings similar to those used by the PC1512 keyboard (set data, wait for 5µs, set clock, wait for 5µs, return both lines to high, wait for 40µs).
 
 ## 10.4.2 Wire protocol
 Unlike a PC keyboard, the PCW keyboard does not send scancodes. Instead, it repeatedly sends the entire keyboard state: 17 words of 12 bits each
