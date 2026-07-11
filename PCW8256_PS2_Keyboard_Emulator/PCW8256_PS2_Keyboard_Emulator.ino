@@ -31,9 +31,9 @@
 // keyboard, but measure the available current and the keyboard's inrush/current
 // draw before relying on that supply path.
 
-#define DIAG_PCW_OUTPUT_ONLY 1
+#define DIAG_PCW_OUTPUT_ONLY 0
 #define DIAG_PS2_ONLY        0
-#define DIAG_FULL_EMULATOR   0
+#define DIAG_FULL_EMULATOR   1
 // Bypasses Timer1/the ISR entirely and just busy-loops CLK low 21us / high
 // 12us via delayMicroseconds(). Enable this alone (set the others to 0) to
 // check whether basic 21/12us timing holds on this board, decoupled from
@@ -51,14 +51,14 @@
 // between adjacent PORTD pins) rather than the CLK state machine itself.
 #define DIAG_FORCE_DATA_LOW 0
 // Disables Timer0's overflow interrupt in setup(), silencing the Arduino
-// millis()/micros() tick that otherwise fires every ~1.024ms and preempts
-// the Timer1 CLK ISR. With the CTC-based scheduler this no longer stretches
-// pulse widths (interval is timed from the hardware compare match, not the
-// ISR), but it can still delay a CLK edge by the tick ISR's run time; leave
-// enabled for the tightest edges. NOTE: this stops millis()/micros()/delay()
-// advancing (the DIAG_PCW_OUTPUT_ONLY heartbeat just won't print);
-// delayMicroseconds() still works as it is a busy-loop.
-#define DIAG_DISABLE_TIMER0_IRQ 1
+// millis()/micros() tick. The CTC-based scheduler no longer needs this (the
+// tick can delay a CLK edge by a few us but can't stretch a pulse width), so
+// keep it 0 for normal use. Only worth enabling for a pure DIAG_PCW_OUTPUT_ONLY
+// timing capture where you want the very tightest edges AND nothing depends on
+// millis(). Do NOT enable it with DIAG_FULL_EMULATOR / DIAG_PS2_ONLY: the PS/2
+// library and delay() rely on millis()/micros(), so freezing them can cause
+// missed or stuck keys. (delayMicroseconds() still works — it's a busy-loop.)
+#define DIAG_DISABLE_TIMER0_IRQ 0
 
 namespace
 {

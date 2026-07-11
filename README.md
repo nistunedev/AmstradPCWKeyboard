@@ -37,6 +37,47 @@ The repository includes `CPM_14_keyboard.dsk`, a CP/M disk image containing the
 diagnostic utility. The diagnostic can also be rebuilt and inserted by running
 `build_keytest.bat` on Windows.
 
+## Development Status
+
+The transmitter and PS/2 key path have been validated with a logic analyser
+(1 MHz timing capture, VCD export decoded offline). Confirmed working:
+
+- **Clock waveform** — per bit ~12 µs high / ~21 µs low, with one high pulse
+  per 12-bit word omitted so the real CLK holds low for an extended (~54 µs)
+  merged low, matching the real keyboard's skipped pulse.
+- **Frame structure** — 17 words per frame, offset nibbles run
+  `F, 0, 1, … , E, F` with no slippage; transmitting flag (bit 7 of byte 0xF)
+  set on the first word and clear on the last; update-toggle (bit 6 of 0xF)
+  alternates every frame; link-status byte 0xD reads `0x80` (LK1 not fitted).
+- **Inter-frame gap** — ~6.25 ms.
+- **DATA/CLK alignment** — DATA is stable across each bit and latched on the
+  CLK falling edge; decoding DATA against the clock recovers each word cleanly.
+- **End-to-end key path** — pressing `A` (PS/2) sets byte 0x08 bit 5 (`0x20`)
+  in the transmitted frame and clears it on release, with all other bytes
+  unchanged. This exercises the full chain: PS/2 make/break → key map → matrix
+  → frame build → ISR bit-bang → correctly framed PCW output.
+
+Diagnostic build flags at the top of the firmware select the run mode
+(`DIAG_FULL_EMULATOR` for normal operation, `DIAG_PS2_ONLY` to dump decoded
+PS/2 keys to serial, `DIAG_PCW_OUTPUT_ONLY` to transmit an idle frame,
+`DIAG_CLK_TIMING_TEST` for a bare clock toggle) plus isolation toggles
+(`DIAG_DISABLE_WORD_SKIP`, `DIAG_FORCE_DATA_LOW`, `DIAG_DISABLE_TIMER0_IRQ`)
+and `PCW_INVERT_CLK` for physical clock polarity. A D6 diagnostic pin mirrors
+the clock without the per-word skip, as a uniform reference for scope/analyser
+comparison.
+
+### Open items
+
+- **Not yet tested against a real PCW.** `KEYTEST.COM` on actual hardware is
+  needed to confirm `PCW_INVERT_CLK` polarity is electrically correct (the
+  analyser alone can't distinguish a real inversion from a probe/channel
+  setting) and that the ~54 µs merged low is accepted by the gate array.
+- **~32 ms transmit pause on key events.** Each PS/2 make/break coincides with
+  the transmitter stalling for ~32 ms (about five frames) before resuming
+  mid-frame where it left off. No bits are lost and it is likely harmless, but
+  the cause (something blocking the transmitter ISR during key handling) is not
+  yet understood.
+
 ## Tools
 
 - `pasmo.exe` is included for Windows builds of `KEYTEST.COM`.
