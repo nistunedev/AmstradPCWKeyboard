@@ -5,7 +5,7 @@
 - Active firmware: `D:\PCW\projects\AmstradPCWKeyboard\PCW8256_PS2_Keyboard_Emulator\PCW8256_PS2_Keyboard_Emulator.ino`
 - Target: Arduino Nano emulating the Amstrad PCW keyboard controller.
 - Purpose: Read PS/2 keyboard events, maintain a PCW keyboard matrix, and repeatedly transmit complete PCW keyboard state frames over the PCW keyboard `CLK` and `DATA` lines.
-- Electrical model: PCW `CLK` and `DATA` are driven push-pull as `OUTPUT` pins (D3/D5), backed by external 10k pull-ups to +5V. Previously these were open-collector (`INPUT_PULLUP` release + drive-low only); switched to push-pull once the external pull-ups made the internal weak pull-up unnecessary, giving faster/cleaner edges with no contention risk since the Arduino is the sole driver on this point-to-point link.
+- Electrical model: PCW `CLK` and `DATA` are driven push-pull as `OUTPUT` pins (D3/D5), backed by external 10k pull-ups to +5V. The PCW motherboard also pulls the lines high when disconnected/undriven, but a real attached keyboard actively drives both lines low most of the time, including the gaps between frame bursts.
 
 ## Intended Wire Protocol
 
@@ -22,26 +22,16 @@ Packet order:
 2. Offsets `0x00` through `0x0E`.
 3. Offset `0x0F` with transmit/status bit clear.
 
-### Per-word DATA double-toggle — documented but NOT yet implemented
+### Per-word DATA double-toggle - implemented in current test build
 
-John Elliott's protocol notes (see README §10) state:
+John Elliott's protocol notes (see README section 10) state:
 
 > "The PCW keyboard toggles the DATA line twice before sending each word, but the gate array at the PCW end doesn't seem to need this."
 
-The original keyboard emits **two DATA toggles as a preamble before each 12-bit
-word**. Our firmware does **not** do this — we have never sent it, on the
-assumption (per Elliott) that it is unnecessary.
-
-**This is now a leading suspect.** Logic-analyser captures confirm our emitted
-frame is otherwise completely correct (consistent 204-bit frames, valid all-zero
-"no keys" content, correct offset sequence `F,0,1,…,E,F`, correct flag/link
-bytes, and the 12-pulse + ~48µs-gap waveform), yet the real PCW still rejects it
-and shows garbage. Since every other documented aspect is matched, this per-word
-DATA double-toggle — which this particular gate array may actually require for
-per-word synchronisation — is one of the two remaining untested dimensions (the
-other being clock polarity, `PCW_INVERT_CLK`). It should be implemented and
-included in the convention sweep (see `CONVENTION_SWEEP_HANDOFF.md`): a mode that
-inserts two DATA transitions immediately before each word's first bit.
+The original keyboard emits **two DATA pulses as a preamble before each 12-bit
+word**. This is now implemented as two full DATA-only pulses before every word,
+with CLK held low throughout the preamble. Each pulse edge is held for
+`PCW_DATA_TOGGLE_US`.
 
 ## Matrix State Intention
 
@@ -65,6 +55,8 @@ Observed/target timing from real PCW keyboard traces:
 - Normal `CLK` low: about `21us`
 - Once per 12-bit word, the 5th bit's high pulse is skipped entirely (no `CLK` edge), merging that bit's low period into the previous one. Combined low is about `42-45us`, consistent with the `~48us` extended low observed on the real keyboard.
 - Inter-frame idle gap: about `6.25ms`.
+- Inter-frame/default driven level from an attached keyboard: `CLK` low and `DATA` low. This differs from the disconnected motherboard fail-safe level, which is pulled high.
+- Before each 12-bit word: two full DATA-only pulses, with CLK held low.
 - `DATA` latched by the PCW on the falling edge of `CLK`; the firmware sets each bit's `DATA` during the preceding low period, giving ample setup time.
 
 ### Polarity / inversion
@@ -86,6 +78,7 @@ Implemented so far:
 - PCW `CLK`/`DATA` are push-pull `OUTPUT` pins (D3/D5) backed by external 10k pull-ups; briefly went through an open-collector (`INPUT_PULLUP` + drive-low) phase before switching back once the pull-ups made that unnecessary.
 - Reworked Timer1 from a fast tick-counter ISR to edge-scheduled compare intervals.
 - Added explicit `6.25ms` inter-frame gap.
+- Added the two DATA-only pre-word pulses documented for the original 8048 keyboard.
 - Fixed large random frame delays by resetting `TCNT1` before setting `OCR1A` in `scheduleTimer1Us()`.
 - Fixed a clock/data glitch by separating `CLK` rising edge from `DATA` transition:
   - `CLK` rises
@@ -100,6 +93,9 @@ Important current timing constants:
 - `PCW_CLOCK_LOW_US = 21`
 - `PCW_WORD_SKIP_BIT_INDEX = 4` (0-indexed 5th bit of each word; its high pulse is skipped)
 - `PCW_FRAME_GAP_US = 6250`
+- `PCW_IDLE_HIGH = 0` (drive CLK/DATA low between frames, matching the real keyboard trace)
+- `PCW_DATA_TOGGLE_US = 12` (hold time for each DATA-only pre-word pulse edge)
+- `PCW_INVERT_DATA = 0` (natural DATA polarity through the double-inverted PCW input path)
 - `PCW_INVERT_CLK = 1` (drive physical CLK inverted; see Polarity note above)
 
 ## Current Observed Behaviour / open items
@@ -148,8 +144,6 @@ Set exactly one run mode (`DIAG_PCW_OUTPUT_ONLY` / `DIAG_PS2_ONLY` / `DIAG_FULL_
   frame bug. `KEYTEST.COM` cannot be used as a check here — the PCW phantoms
   keypresses at idle, which aborts `PROFILE.SUB` before KEYTEST launches. The
   practical success oracle is instead **"PCW sits quietly at `A>`"** = correct.
-- **Two untested conventions remain**, to be resolved by the sweep
-  (`CONVENTION_SWEEP_HANDOFF.md`):
-  - The per-word **DATA double-toggle** above (never sent).
-  - **Clock polarity** `PCW_INVERT_CLK` (never flipped; couples with idle level).
+- **Remaining convention to verify**:
+  - **Clock polarity** `PCW_INVERT_CLK` (couples with idle level).
 

@@ -151,23 +151,19 @@ constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY hear
 // KEYTEST.COM; flip it if keys misread.
 #define PCW_INVERT_CLK 0
 
-// Idle level for CLK/DATA between frames (the ~6.25 ms inter-frame gap) and
-// before the first frame. The PCW hardware notes say a real keyboard rests
-// both lines HIGH when not actively transmitting (they are pulled high on the
-// motherboard; a keyboard only drives them low while sending a frame), and
-// that high/idle lines read as "no keys". Default 1 (idle high) to match.
-// Set 0 to idle low. This is a prime suspect if the PCW cannot frame our
-// output — flip it if the real machine shows garbage.
-#define PCW_IDLE_HIGH 1
+// Idle level driven by an attached keyboard between frames (the ~6.25 ms
+// inter-frame gap) and before the first frame. The PCW motherboard pull-ups
+// make disconnected/undriven lines read HIGH, but James Ots' real-keyboard
+// traces and our captures show the active keyboard drives both CLK and DATA
+// LOW most of the time, including between frame bursts. Default 0 (driven
+// low) to match the real keyboard's active resting state.
+#define PCW_IDLE_HIGH 0
 
-// DATA line sense. On the PCW a released/high DATA line reads as bit 0 (an
-// unplugged keyboard, lines high, reads as all-zero / no keys), so a driven
-// LOW is bit 1 — the opposite of the natural "high = 1" mapping. With this
-// set, a logical 1 bit is driven LOW and a logical 0 bit is driven HIGH, so
-// our all-zero idle frame reads as "no keys" on the real machine. Set 0 for
-// the natural mapping (matches the DIAG decode on the analyser). Flip if the
-// PCW reads keys inverted (e.g. floods characters with nothing pressed).
-#define PCW_INVERT_DATA 1
+// DATA line sense. The PCW input path is double-inverted through the 74HC14
+// buffer chain, so the current working convention is natural polarity:
+// logical 1 drives DATA high, logical 0 drives DATA low. Set 1 only for an
+// explicit inverted-data diagnostic run.
+#define PCW_INVERT_DATA 0
 
 constexpr uint16_t TIMER1_PRESCALER = 8;  // Timer1 clock/8, giving TIMER1_COUNTS_PER_US counts per microsecond
 constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;  // Timer1 ticks per microsecond
@@ -182,6 +178,7 @@ constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse
 constexpr uint8_t PCW_CLOCK_LONG_LOW_US = 48;  // extended CLK-low after the 4th pulse of each word
 constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // low following this bit's pulse is the long one
 constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
+constexpr uint8_t PCW_DATA_TOGGLE_US = 12;  // hold time for each DATA-only pre-word pulse edge
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -357,18 +354,21 @@ struct PcwKeyMatrixEntry
 };
 
 // Transmitter bit-clock state machine, driven one step per call of
-// ISR(TIMER1_COMPA_vect). Two phases per bit, each toggling CLK as its very
-// first action: RaiseClock drives CLK high for PCW_CLOCK_HIGH_US, LowerClock
-// drives CLK low for PCW_CLOCK_LOW_US (latching that bit's DATA on the
-// falling edge) then advances to the next bit. FrameGap holds the lines idle
-// during the inter-frame gap; its timer firing starts the first bit of a
-// fresh frame. The per-word skip bit is handled inside LowerClock by staying
-// low for an extra bit period instead of raising the clock.
+// ISR(TIMER1_COMPA_vect). Each 12-bit word starts with the two DATA-only
+// pulses documented for the 8048 keyboard, then two phases per bit toggle
+// CLK: RaiseClock drives CLK high for PCW_CLOCK_HIGH_US, LowerClock drives
+// CLK low for PCW_CLOCK_LOW_US (latching that bit's DATA on the falling edge)
+// then advances to the next bit.
 enum class TxPhase : uint8_t
 {
   FrameGap = 0,
-  RaiseClock = 1,
-  LowerClock = 2
+  WordDataToggle1 = 1,
+  WordDataToggle2 = 2,
+  WordDataToggle3 = 3,
+  WordDataToggle4 = 4,
+  WordDataSetup = 5,
+  RaiseClock = 6,
+  LowerClock = 7
 };
 
 volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per memory-map offset
@@ -383,6 +383,7 @@ volatile bool pcwUpdateToggle = false;  // flips every transmitted frame so the 
 volatile uint16_t txBitIndex = 0;  // index of the next bit to transmit within the active frame buffer
 volatile uint8_t txBitInWord = 0;  // position (0-11) within the current 12-bit word being transmitted
 volatile TxPhase txPhase = TxPhase::FrameGap;  // current state of the transmitter's ISR-driven bit clock
+volatile bool pcwDataLineHigh = false;  // tracked physical DATA level, used for the pre-word pulses
 
 uint8_t frameBuffers[2][PCW_FRAME_BITS];  // double-buffered serialized frame bits, one byte (0/1) per bit
 uint16_t frameLengths[2] = {0, 0};  // bit length of each frameBuffers[] slot; 0 means "not yet built"
@@ -508,12 +509,29 @@ inline void diagClockLow()
 inline void pcwDataHigh()
 {
   PORTD |= _BV(PD5);
+  pcwDataLineHigh = true;
 }
 
 // Drives PCW DATA (D5) low.
 inline void pcwDataLow()
 {
   PORTD &= static_cast<uint8_t>(~_BV(PD5));
+  pcwDataLineHigh = false;
+}
+
+// Toggles PCW DATA without clocking. The original PCW keyboard emits two
+// DATA pulses before each 12-bit word; from the low resting state that means
+// four DATA transitions while CLK remains low.
+inline void pcwDataToggle()
+{
+  if (pcwDataLineHigh)
+  {
+    pcwDataLow();
+  }
+  else
+  {
+    pcwDataHigh();
+  }
 }
 
 // Drives CLK, the D6 mirror, and DATA to the inter-frame idle level selected
@@ -862,7 +880,7 @@ void loadCurrentPcwData()
 #else
   bool high = frameBuffers[activeFrameIndex][txBitIndex] != 0;
 #if PCW_INVERT_DATA
-  high = !high;  // PCW reads a high DATA line as 0, so a 1 bit is driven low
+  high = !high;
 #endif
   if (high)
   {
@@ -885,6 +903,18 @@ void startCurrentPcwBit()
   diagClockHigh();  // mirror (D6) — bit 0 is never the skip bit
   scheduleTimer1Us(PCW_CLOCK_HIGH_US);
   txPhase = TxPhase::LowerClock;
+}
+
+// Starts the two DATA-only pulses that precede each 12-bit word.
+// CLK remains low throughout; WordDataSetup then loads the first word bit
+// and raises CLK to begin normal bit transmission.
+void startCurrentPcwWordPreamble()
+{
+  pcwClockLow();
+  diagClockLow();
+  pcwDataToggle();
+  scheduleTimer1Us(PCW_DATA_TOGGLE_US);
+  txPhase = TxPhase::WordDataToggle2;
 }
 
 // Starts building the next frame into the inactive frame buffer slot.
@@ -1221,6 +1251,32 @@ ISR(TIMER1_COMPA_vect)
   switch (txPhase)
   {
     case TxPhase::FrameGap:
+      startCurrentPcwWordPreamble();
+      break;
+
+    case TxPhase::WordDataToggle1:
+      startCurrentPcwWordPreamble();
+      break;
+
+    case TxPhase::WordDataToggle2:
+      pcwDataToggle();
+      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
+      txPhase = TxPhase::WordDataToggle3;
+      break;
+
+    case TxPhase::WordDataToggle3:
+      pcwDataToggle();
+      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
+      txPhase = TxPhase::WordDataToggle4;
+      break;
+
+    case TxPhase::WordDataToggle4:
+      pcwDataToggle();
+      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
+      txPhase = TxPhase::WordDataSetup;
+      break;
+
+    case TxPhase::WordDataSetup:
       startCurrentPcwBit();
       break;
 
@@ -1278,7 +1334,6 @@ ISR(TIMER1_COMPA_vect)
         break;
       }
 
-      loadCurrentPcwData();
       // The low following the 4th pulse (bit 3) is stretched to ~48us as the
       // per-word sync marker; every other low is the normal ~21us.
       {
@@ -1291,7 +1346,15 @@ ISR(TIMER1_COMPA_vect)
 #endif
         scheduleTimer1Us(lowUs);
       }
-      txPhase = TxPhase::RaiseClock;
+      if (txBitInWord == 0)
+      {
+        txPhase = TxPhase::WordDataToggle1;
+      }
+      else
+      {
+        loadCurrentPcwData();
+        txPhase = TxPhase::RaiseClock;
+      }
       break;
     }
 

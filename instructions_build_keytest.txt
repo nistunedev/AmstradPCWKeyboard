@@ -28,6 +28,9 @@ Safe CP/M Box transfer
 CPM_14_keyboard.dsk is a SAMdisk Extended DSK. Do not modify it with the
 bundled iDSK 0.20 or the tested cpmtools build. Both misinterpret this image's
 track geometry and can create directory entries whose data loads as garbage.
+The concrete iDSK bug evidence (phantom tracks 40/41 from SAMdisk's Offset-Info
+trailer, and the sector interleave/skew iDSK ignores on write) is recorded in
+idsk_issues.md, to be filed upstream (github.com/cpcsdk/idsk) in a later session.
 
 1. In CP/M Box, map the project's cpm_transfer folder as CP/M drive M:.
 2. Boot CP/M Plus with CPM_14_keyboard.dsk in drive A:.

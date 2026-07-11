@@ -55,7 +55,8 @@ The transmitter and PS/2 key path have been validated with a logic analyser
   `F, 0, 1, … , E, F` with no slippage; transmitting flag (bit 7 of byte 0xF)
   set on the first word and clear on the last; update-toggle (bit 6 of 0xF)
   alternates every frame; link-status byte 0xD reads `0x80` (LK1 not fitted).
-- **Inter-frame gap** — ~6.25 ms.
+- **Inter-frame gap** - ~6.25 ms, with the attached keyboard's driven
+  resting state low on both `CLK` and `DATA`.
 - **DATA/CLK alignment** — DATA is stable across each bit and latched on the
   CLK falling edge; decoding DATA against the clock recovers each word cleanly.
 - **End-to-end key path** — pressing `A` (PS/2) sets byte 0x08 bit 5 (`0x20`)
@@ -231,7 +232,7 @@ The pinout above shows the keyboard socket on the PCW, seen from the outside of 
 
 <img src="images/PCW-connector.png" alt="PCW keyboard connector pinout" height="330">
 
-By default, the data and clock lines are high on the motherboard (confirmed via scope). Although they are pulled high on the PCW motherboard, they are actually driven low most of the time (by the keyboard when it is active)
+By default, the data and clock lines are high on the motherboard when no keyboard is driving them (confirmed via scope). Although they are pulled high on the PCW motherboard, James Ots' real-keyboard timing traces and our captures show that an attached keyboard actually drives both lines low most of the time, including the gaps between frame bursts.
 
 Verifying the circuit diagrams: Confirmed that DATA and CLK signals go into a TC74HC14 (schmit trigger inverter) twice. Effectively inverting the signal and then reversing the signal, acting as a buffer. Both signals have a 100K pullup to 5VCC, explaining the internal pull up on the PCW.
 

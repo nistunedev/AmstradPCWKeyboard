@@ -4,13 +4,17 @@
 ; keyboard state bytes from BFF0h-BFFFh into local memory, restores CP/M's TPA
 ; block 6, and displays the physical offsets 3FF0h-3FFFh. Screen output uses
 ; CP/M BDOS functions 2 and 9.
-; Pressing any key exits through the CP/M warm-boot entry at address 0000h.
+; The display refreshes continuously and the program NEVER reads the console,
+; so stray/phantom key characters (as seen from a faulty keyboard) cannot
+; terminate it. Exit only by resetting the machine.
 ;
 ; Build with the Pasmo Z80 assembler:
 ; https://pasmo.speccy.org/
 ;
-; Insert KEYTEST.COM into the CP/M disk image with iDSK 0.20:
-; https://github.com/cpcsdk/idsk
+; Copy KEYTEST.COM into the CP/M disk image with a tool that honours this
+; image's sector interleave (e.g. CPCDiskXP, or transfer inside the emulator).
+; Do NOT use iDSK 0.20 on CPM_14_keyboard.dsk - it corrupts writes; see
+; idsk_issues.md.
 ;
         org     0100h
 
@@ -67,10 +71,9 @@ row:
         djnz    row
 
         call    delay
-        call    read_console_nonblocking
-        cp      1bh
-        jr      nz,refresh
-        jp      0000h
+        ; Loop forever. The console is never read, so a phantom key stream
+        ; from a faulty keyboard cannot exit the program. Reset to leave.
+        jr      refresh
 
 snapshot_keyboard:
         push    af
@@ -164,18 +167,6 @@ print_string:
         pop     bc
         ret
 
-read_console_nonblocking:
-        push    bc
-        push    de
-        push    hl
-        ld      e,0ffh
-        ld      c,6
-        call    BDOS
-        pop     hl
-        pop     de
-        pop     bc
-        ret
-
 delay:
         push    bc
         push    de
@@ -200,7 +191,7 @@ cursor_home:
         db      1bh,'H','$'
 title:
         db      'KEYTEST.COM running - physical block 3, 3FF0h-3FFFh',13,10
-        db      'Press ESC to exit',13,10,'$'
+        db      'Runs continuously - reset the machine to exit',13,10,'$'
 build_timestamp:
         include "build_timestamp.inc"
 
