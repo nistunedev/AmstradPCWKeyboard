@@ -119,7 +119,7 @@ Both keyboards use the same controller: an 8048, part number 40027.
 
 Keyboard matrix from the PCW9512 service manual:
 
-![PCW keyboard matrix (service manual)](images/PCW%20keyboard%20matrix%20-%20service%20manual.png)
+<img src="images/PCW%20keyboard%20matrix%20-%20service%20manual.png" alt="PCW keyboard matrix (service manual)" height="748">
 
 The keyboard appears as a memory-mapped device at 3FF0h–3FFFh in memory block 3.
 
@@ -229,7 +229,7 @@ The pinout above shows the keyboard socket on the PCW, seen from the outside of 
 
 ## 10.4.1 Hardware connection
 
-![PCW keyboard connector pinout](images/PCW-connector.png)
+<img src="images/PCW-connector.png" alt="PCW keyboard connector pinout" height="330">
 
 By default, the data and clock lines are high on the motherboard (confirmed via scope). Although they are pulled high on the PCW motherboard, they are actually driven low most of the time (by the keyboard when it is active)
 
