@@ -81,10 +81,27 @@ correct* transmission makes it go quiet.)
 | high | normal | normal | skip (11 pulses) | repeating flood + beeps |
 | high | inverted | normal | skip (11 pulses) | structured bursts |
 | high | inverted | normal | uniform (12 pulses, no gap) | garbage, faster |
-| high | inverted | normal | **48µs gap (12 pulses)** | **not yet tested at handoff time** |
+| high | inverted | normal | **48µs gap (12 pulses)** | **garbage — but see below** |
 
-**Never tried: inverting the CLOCK polarity (`PCW_INVERT_CLK=1`).** That is the
-single most important untested dimension.
+**Important result for the 48µs-gap build:** a logic-analyser capture
+(`PCW7-boot.vcd`) confirms the emitted frame is **completely correct** — every
+frame has exactly 204 DIAG rising edges (12×17), the DATA-inverted decode gives
+a valid all-zeros "no keys" frame with the right `F,0,1,…,E,F` offset sequence,
+link byte 0xD = 0x80, and correct flag/toggle bits, and the waveform matches
+James's 12-pulse + ~48µs-gap timing. So **we have now matched every documented,
+measurable aspect of the protocol and the PCW still garbages.**
+
+**Two untested dimensions remain — both belong in the sweep:**
+
+1. **Clock polarity (`PCW_INVERT_CLK=1`)** — never tried. NOTE: flipping it also
+   flips the idle level (idle uses `pcwClockHigh`), so pair it with the idle
+   flag so idle stays physically high, or the two interact.
+2. **DATA double-toggle before each word.** John Elliott: *"the keyboard toggles
+   the DATA line twice before sending each word, but the gate array doesn't seem
+   to need this."* We have NEVER sent this. It is the one documented protocol
+   feature still missing and a strong candidate for the per-word sync this gate
+   array may actually require. Add it as a sweep option (off / two DATA toggles
+   inserted before each 12-bit word).
 
 ## 7. Why KEYTEST.COM can't be used here
 
@@ -103,11 +120,16 @@ through their combinations automatically, so the real PCW reveals the right one.
 
 **Settings to sweep** (currently compile-time `#define`s in the firmware):
 
-1. `PCW_INVERT_CLK` — physical clock polarity (0/1). **Highest priority; never tested.**
+1. `PCW_INVERT_CLK` — physical clock polarity (0/1). **Highest priority; never
+   tested.** Pair with idle level so idle stays physically high.
 2. `PCW_INVERT_DATA` — a `1` bit driven low (1) vs high (0).
 3. `PCW_IDLE_HIGH` — lines rest high (1) vs low (0) between frames.
 4. Word structure — uniform 21µs lows vs a 48µs long low after the 4th pulse
    (the `DIAG_DISABLE_WORD_SKIP` mechanism, now reworked to keep all 12 pulses).
+5. **DATA double-toggle before each word** (off / on). Never tried; documented
+   but assumed unnecessary — a prime candidate for this gate array's word sync.
+   With the 48µs-gap build's frame proven correct on the analyser yet still
+   rejected, this and clock polarity are the most likely missing pieces.
 
 **Suggested sweep implementation:**
 
