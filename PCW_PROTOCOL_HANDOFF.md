@@ -22,6 +22,27 @@ Packet order:
 2. Offsets `0x00` through `0x0E`.
 3. Offset `0x0F` with transmit/status bit clear.
 
+### Per-word DATA double-toggle — documented but NOT yet implemented
+
+John Elliott's protocol notes (see README §10) state:
+
+> "The PCW keyboard toggles the DATA line twice before sending each word, but the gate array at the PCW end doesn't seem to need this."
+
+The original keyboard emits **two DATA toggles as a preamble before each 12-bit
+word**. Our firmware does **not** do this — we have never sent it, on the
+assumption (per Elliott) that it is unnecessary.
+
+**This is now a leading suspect.** Logic-analyser captures confirm our emitted
+frame is otherwise completely correct (consistent 204-bit frames, valid all-zero
+"no keys" content, correct offset sequence `F,0,1,…,E,F`, correct flag/link
+bytes, and the 12-pulse + ~48µs-gap waveform), yet the real PCW still rejects it
+and shows garbage. Since every other documented aspect is matched, this per-word
+DATA double-toggle — which this particular gate array may actually require for
+per-word synchronisation — is one of the two remaining untested dimensions (the
+other being clock polarity, `PCW_INVERT_CLK`). It should be implemented and
+included in the convention sweep (see `CONVENTION_SWEEP_HANDOFF.md`): a mode that
+inserts two DATA transitions immediately before each word's first bit.
+
 ## Matrix State Intention
 
 - Idle key matrix bytes are `0x00`.
@@ -118,8 +139,17 @@ Set exactly one run mode (`DIAG_PCW_OUTPUT_ONLY` / `DIAG_PS2_ONLY` / `DIAG_FULL_
 
 ## Validation State
 
-- **Bench waveform confirmed good** (analyser, `DIAG_PCW_OUTPUT_ONLY`, 2026-07-11): polarity correct, ~12us high / ~21us low, no jitter, D3 shows the ~54us merged low once per word while the D6 mirror stays a uniform no-skip clock.
-- **Still to verify on real hardware:** run `KEYTEST.COM` on an actual PCW in `DIAG_FULL_EMULATOR` mode to confirm keys read correctly. Two things that only real hardware can settle:
-  - `PCW_INVERT_CLK` polarity (currently `0`) — flip if keys misread.
-  - Extended-low width is ~54us vs the real keyboard's ~48us — tune only if the PCW proves sensitive to it.
+- **Bench/analyser: fully confirmed.** Consistent 204-bit frames, correct
+  content (all-zero "no keys" idle, `F,0,1,…,E,F` offsets, link 0xD=0x80,
+  flag/toggle bits), ~12us high / ~21us low, ~48us gap after the 4th pulse, no
+  jitter. The emitted frame is provably correct.
+- **Real PCW: not yet working.** The machine still shows garbage even though the
+  frame is provably correct, so this is a signalling-convention mismatch, not a
+  frame bug. `KEYTEST.COM` cannot be used as a check here — the PCW phantoms
+  keypresses at idle, which aborts `PROFILE.SUB` before KEYTEST launches. The
+  practical success oracle is instead **"PCW sits quietly at `A>`"** = correct.
+- **Two untested conventions remain**, to be resolved by the sweep
+  (`CONVENTION_SWEEP_HANDOFF.md`):
+  - The per-word **DATA double-toggle** above (never sent).
+  - **Clock polarity** `PCW_INVERT_CLK` (never flipped; couples with idle level).
 
