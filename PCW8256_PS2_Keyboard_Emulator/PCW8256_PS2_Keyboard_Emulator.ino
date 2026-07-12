@@ -48,7 +48,7 @@
 // words back-to-back with no preamble). Diagnostic for whether the preamble's
 // DATA edges are the source of the intermittent last-bit (value bit 0) latches
 // seen on real hardware. Set 0 for the normal per-word preamble.
-#define DIAG_DISABLE_WORD_PREAMBLE 0
+#define DIAG_DISABLE_WORD_PREAMBLE 1
 // Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
 // DATA never toggles. Use to test whether CLK timing irregularities are
 // correlated with DATA transitions (e.g. simultaneous-switching noise
@@ -126,6 +126,15 @@ constexpr uint8_t PCW_FLAG_INITIAL = 0xC0;  // initial flag-word byte before the
 constexpr uint8_t PCW_MAX_MATRIX_OFFSET = 0x0F;  // largest valid pcwState offset (4-bit nibble)
 constexpr uint8_t PCW_MAX_MATRIX_BIT = 7;  // largest valid bit index within a matrix byte
 constexpr uint8_t PCW_HOLD_COUNT_MAX = 0xFF;  // saturation cap for holdCount[] entries
+// Dropped-break recovery: a held key whose PS/2 break byte was lost (corrupted
+// by the transmitter's interrupt-off preamble windows) would otherwise stay
+// "down" and auto-repeat on the PCW. We use the keyboard's typematic repeat as
+// a keepalive: while a key is physically held the PS/2 keyboard resends make
+// codes, refreshing keyLastMakeMs[]. If no make (initial or repeat) arrives for
+// this long, the key is treated as released. Must exceed the typematic delay
+// configured in setup() (typematic(0,0) = 0.25s), with margin, and also exceed
+// the keyboard's default 0.5s delay in case that command didn't take effect.
+constexpr uint16_t KEY_STUCK_RELEASE_MS = 600;
 constexpr uint8_t FRAME_BUFFER_TOGGLE_MASK = 0x01;  // XOR mask to flip between the 2 frameBuffers[] slots
 
 constexpr uint16_t PS2_CODE_SPACE = 256;  // PS/2 scancodes are 8-bit (0x00-0xFF)
@@ -183,8 +192,8 @@ constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse
 constexpr uint8_t PCW_CLOCK_LONG_LOW_US = 48;  // extended CLK-low after the 4th pulse of each word
 constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // low following this bit's pulse is the long one
 constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
-constexpr uint8_t PCW_PREAMBLE_PULSE_US = 6;  // each pre-word DATA half-pulse (high/low/high), CLK low
-constexpr uint8_t PCW_PREAMBLE_TAIL_US = 30;  // DATA held high after the preamble before CLK rises
+constexpr uint8_t PCW_PREAMBLE_PULSE_US = 6;  // each pre-word DATA half-pulse (high/low/high/low), CLK low, matching the real keyboard
+constexpr uint8_t PCW_PREAMBLE_TAIL_US = 30;  // DATA held low after the preamble before CLK rises
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -359,29 +368,24 @@ struct PcwKeyMatrixEntry
   PcwMatrixEntry matrix;  // where that key's bit lives in pcwState
 };
 
-// Transmitter bit-clock state machine, driven one step per call of
-// ISR(TIMER1_COMPA_vect). Each 12-bit word is preceded by a DATA-only preamble
-// (all with CLK low): high/low/high/low in PCW_PREAMBLE_PULSE_US steps,
-// then a PCW_PREAMBLE_TAIL_US hold before CLK rises. Each data bit is two
-// phases: ClockRise raises CLK and sets this bit's DATA (so DATA changes during
-// the CLK-high), and ClockFall drops CLK (latching DATA on the falling edge)
-// then advances. DATA therefore only ever changes during CLK-high (data) or in
-// the preamble (sync), never during a data bit's CLK-low.
+// Transmitter bit-clock state machine, driven one step per Timer1 compare.
+// Each 12-bit word is preceded by a DATA-only preamble emitted inside one ISR
+// entry: DATA high/low/high/low at 6us intervals while CLK stays low, then a
+// tail hold. Data bits keep the lower-ISR-load two-phase timing: ClockRise sets
+// CLK high and DATA, ClockFall drops CLK to latch and schedules the low period.
 enum class TxPhase : uint8_t
 {
   FrameGap = 0,
-  PreambleHigh1 = 1,  // DATA high, PCW_PREAMBLE_PULSE_US (CLK low)
-  PreambleLow1 = 2,   // DATA low,  PCW_PREAMBLE_PULSE_US
-  PreambleHigh2 = 3,  // DATA high, PCW_PREAMBLE_PULSE_US
-  PreambleLow2 = 4,   // DATA low,  PCW_PREAMBLE_PULSE_US
-  PreambleTail = 5,   // DATA held low, PCW_PREAMBLE_TAIL_US, then CLK rises
-  ClockRise = 6,      // CLK high + set this bit's DATA, hold the 12us high
-  ClockFall = 7       // CLK low (latch), advance, then the CLK-low period
+  PreambleBurst = 1,  // DATA high/low/high/low at 6us intervals, CLK low
+  PreambleTail = 2,   // DATA held low, PCW_PREAMBLE_TAIL_US, then CLK rises
+  ClockRise = 3,      // CLK high + set this bit's DATA, hold the 12us high
+  ClockFall = 4       // CLK low (latch), advance, then the CLK-low period
 };
 
 volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per memory-map offset
 uint8_t ps2Held[PS2_HELD_BITMAP_BYTES];  // bitmap of PS/2 scancodes currently held (make seen, no break yet)
 uint8_t holdCount[PCW_KEY_COUNT];  // per-PcwKey ref count of PS/2 codes mapped to it, for overlap-safe release
+uint16_t keyLastMakeMs[PCW_KEY_COUNT];  // millis() (16-bit) of the last make per held PcwKey; drives dropped-break auto-release
 volatile bool frameDirty = false;  // true when pcwState changed since the last frame was built
 
 volatile uint8_t activeFrameIndex = 0;  // index (0 or 1) of frameBuffers[] currently being transmitted
@@ -1116,8 +1120,22 @@ void updatePcwState(const KeyEvent &event)
   }
 
   const uint8_t ps2Code = static_cast<uint8_t>(event.code & PS2_CODE_MASK);
+
+  KeyMapEntry entry;
+  const bool mapped = findKeyMapEntry(event.code, entry);
+  const uint8_t keyIndex =
+      mapped ? static_cast<uint8_t>(entry.key) : PCW_KEY_COUNT;
+  const bool validKey = mapped && keyIndex < PCW_KEY_COUNT;
+
   if (event.pressed)
   {
+    if (validKey)
+    {
+      // Keepalive: record every make (initial AND typematic repeat) so a held
+      // key stays alive; a released key whose break was dropped stops being
+      // refreshed and is auto-released by releaseStuckKeys() in loop().
+      keyLastMakeMs[keyIndex] = static_cast<uint16_t>(millis());
+    }
     if (isPs2Held(ps2Code))
     {
       if (kVerboseKeyDebug)
@@ -1125,9 +1143,8 @@ void updatePcwState(const KeyEvent &event)
         Serial.print(F("Ignoring PS/2 typematic repeat 0x"));
         Serial.println(ps2Code, HEX);
       }
-      return;
+      return;  // typematic repeat: heartbeat recorded above, no state change
     }
-
     setPs2Held(ps2Code, true);
   }
   else
@@ -1135,20 +1152,13 @@ void updatePcwState(const KeyEvent &event)
     setPs2Held(ps2Code, false);
   }
 
-  KeyMapEntry entry;
-  if (!findKeyMapEntry(event.code, entry))
+  if (!validKey)
   {
     if (kVerboseKeyDebug)
     {
       Serial.print(F("No table entry for PS/2 key 0x"));
       Serial.println(event.code, HEX);
     }
-    return;
-  }
-
-  const uint8_t keyIndex = static_cast<uint8_t>(entry.key);
-  if (keyIndex >= PCW_KEY_COUNT)
-  {
     return;
   }
 
@@ -1194,6 +1204,64 @@ void updatePcwState(const KeyEvent &event)
   }
 }
 
+// True for held modifier/toggle keys that do NOT reliably typematic-repeat, so
+// they must be excluded from the keepalive auto-release (a held Shift would
+// otherwise drop mid-hold). These rely on their PS/2 break; a dropped modifier
+// break is rare and self-corrects on the next press of that modifier.
+bool isNonRepeatingModifier(PcwKey key)
+{
+  return key == PCW_KEY_SHIFT || key == PCW_KEY_SHIFT_LOCK ||
+         key == PCW_KEY_ALT || key == PCW_KEY_EXTRA || key == PCW_KEY_STOP;
+}
+
+// Clears the ps2Held bit for every PS/2 scancode that maps to the given PcwKey,
+// so a future real press of that key isn't mistaken for a suppressed repeat.
+void clearHeldForKey(PcwKey key)
+{
+  for (uint16_t i = 0; i < kKeyMapCount; ++i)
+  {
+    KeyMapEntry entry;
+    memcpy_P(&entry, &kKeyMap[i], sizeof(entry));
+    if (entry.key == key)
+    {
+      setPs2Held(static_cast<uint8_t>(entry.ps2Key & PS2_CODE_MASK), false);
+    }
+  }
+}
+
+// Dropped-break recovery. While a key is physically held the PS/2 keyboard
+// resends typematic makes, refreshing keyLastMakeMs[] (see updatePcwState). If
+// no make has arrived for a held key within KEY_STUCK_RELEASE_MS, its break
+// byte was lost in a transmit interrupt-off window, so synthesize the release
+// here. Runs in loop(), outside the timing-critical ISR, so it never disturbs
+// the PCW waveform.
+void releaseStuckKeys()
+{
+  const uint16_t now = static_cast<uint16_t>(millis());
+  for (uint8_t k = 0; k < PCW_KEY_COUNT; ++k)
+  {
+    if (holdCount[k] == 0)
+    {
+      continue;
+    }
+    if (isNonRepeatingModifier(static_cast<PcwKey>(k)))
+    {
+      continue;
+    }
+    if (static_cast<uint16_t>(now - keyLastMakeMs[k]) > KEY_STUCK_RELEASE_MS)
+    {
+      applyKeyState(static_cast<PcwKey>(k), false);
+      holdCount[k] = 0;
+      clearHeldForKey(static_cast<PcwKey>(k));
+      if (kVerboseKeyDebug)
+      {
+        Serial.print(F("Auto-released stuck PCW key "));
+        Serial.println(k, DEC);
+      }
+    }
+  }
+}
+
 // Configures Timer1 in CTC mode (prescaler /8) and arms the first compare
 // match, starting the transmitter's ISR-driven bit clock.
 void setupTimer1()
@@ -1210,17 +1278,14 @@ void setupTimer1()
 }
 
 // Main transmitter state machine, one step per Timer1 compare-match. Each
-// word is preceded by a DATA-only preamble (PreambleHigh1/Low1/High2/Low2/Tail,
-// all with CLK low: high/low/high/low in PCW_PREAMBLE_PULSE_US steps, then a
-// PCW_PREAMBLE_TAIL_US hold). Each data bit is two phases:
-//   ClockRise -> CLK high + set this bit's DATA, wait PCW_CLOCK_HIGH_US
-//   ClockFall -> CLK low (latches DATA on the falling edge), advance, then the
-//                CLK-low period (PCW_CLOCK_LOW_US, or PCW_CLOCK_LONG_LOW_US
-//                after bit 3 as the per-word sync marker)
-// DATA thus only ever changes during CLK-high (data) or in the preamble
-// (sync), never during a data bit's CLK-low. The D6 mirror pulses every bit as an
-// analyser reference. FrameGap holds the lines idle during the inter-frame
-// gap; its timer firing starts the first word's preamble.
+// word is preceded by a DATA-only preamble emitted as one ISR burst: DATA
+// high/low/high/low in PCW_PREAMBLE_PULSE_US busy-waited steps while CLK stays
+// low, then a PCW_PREAMBLE_TAIL_US hold. Data bits stay two-phase to avoid
+// blocking PS/2 receive for the full 12us high on every bit: ClockRise raises
+// CLK and loads DATA, ClockFall drops CLK to latch and schedules the low period.
+// The D6 mirror pulses every bit as an analyser reference. FrameGap holds the
+// lines idle during the inter-frame gap; its timer firing starts the first
+// word's preamble.
 ISR(TIMER1_COMPA_vect)
 {
   const uint8_t currentFrame = activeFrameIndex;
@@ -1248,47 +1313,32 @@ ISR(TIMER1_COMPA_vect)
 #else
       pcwDataLow();  // preamble begins from a low DATA level ("1. low")
       scheduleTimer1Us(PCW_CLOCK_LOW_US);
-      txPhase = TxPhase::PreambleHigh1;
+      txPhase = TxPhase::PreambleBurst;
 #endif
       break;
 
-    case TxPhase::PreambleHigh1:
+    case TxPhase::PreambleBurst:
       pcwDataHigh();
-      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
-      txPhase = TxPhase::PreambleLow1;
-      break;
-
-    case TxPhase::PreambleLow1:
+      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
       pcwDataLow();
-      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
-      txPhase = TxPhase::PreambleHigh2;
-      break;
-
-    case TxPhase::PreambleHigh2:
+      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
       pcwDataHigh();
-      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
-      txPhase = TxPhase::PreambleLow2;
-      break;
-
-    case TxPhase::PreambleLow2:
+      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
       pcwDataLow();
-      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
+      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
+      scheduleTimer1Us(PCW_PREAMBLE_TAIL_US);
       txPhase = TxPhase::PreambleTail;
       break;
 
     case TxPhase::PreambleTail:
-      // DATA stays low; wait, then raise CLK for the first data bit (which
-      // drives DATA to its value just after the rising edge).
-      scheduleTimer1Us(PCW_PREAMBLE_TAIL_US);
+      // DATA stayed low for the scheduled tail; now raise CLK for the first bit.
       txPhase = TxPhase::ClockRise;
-      break;
+      // fall through into ClockRise
 
     case TxPhase::ClockRise:
-      // Raise CLK and set this bit's DATA together: DATA changes just after the
-      // rising edge (during CLK-high, off the CLK-low sync region), then holds
-      // stable for the whole 12us high until the falling-edge latch. Kept as a
-      // single 12us interval (not split at mid-high) so the ISR firing rate
-      // stays low enough for the PS/2 receive interrupt.
+      // Raise CLK and set this bit's DATA together. Keeping this as a scheduled
+      // 12us high (rather than a busy-waited mid-high transition) avoids holding
+      // interrupts off for every bit, which regressed PS/2 break detection.
       diagClockHigh();
       pcwClockHigh();
       loadCurrentPcwData();
@@ -1358,7 +1408,7 @@ ISR(TIMER1_COMPA_vect)
 #else
         pcwDataLow();  // preamble begins from a low DATA level ("1. low")
         scheduleTimer1Us(lowUs);
-        txPhase = TxPhase::PreambleHigh1;
+        txPhase = TxPhase::PreambleBurst;
 #endif
       }
       else
@@ -1408,6 +1458,10 @@ void setup()
 
   #if DIAG_PS2_ONLY || DIAG_FULL_EMULATOR
   keyboard.begin(PS2_DATA_PIN, PS2_CLK_PIN);
+  // NOTE: left at the keyboard's default typematic (10.9 CPS, 0.5s delay). A
+  // faster rate was tried to tighten the keepalive but it flooded the PS/2 bus
+  // and worsened transmitter jitter (idle/typing ghosts). KEY_STUCK_RELEASE_MS
+  // is sized for the default 0.5s delay.
   #endif
 
   #if (DIAG_PCW_OUTPUT_ONLY || DIAG_FULL_EMULATOR) && (STARTUP_IDLE_MS > 0)
@@ -1481,6 +1535,7 @@ void loop()
     updatePcwState(ev);
   }
 
+  releaseStuckKeys();  // recover any held key whose PS/2 break byte was dropped
   sendPcwFrame();
   #endif
 }
