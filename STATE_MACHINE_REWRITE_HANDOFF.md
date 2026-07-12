@@ -100,16 +100,6 @@ the within-word bit index (confirm index 3 vs 4 against the trace).
    Everything is purely clock-driven, mirroring the real keyboard's internal
    processor. One fixed 6µs CTC tick drives the whole hierarchy.
 
-## RAM is TIGHT — ~4% free (≈96% used)
-
-`keyLastMakeMs[PCW_KEY_COUNT]` is the pressure: `PCW_KEY_COUNT = 127`, so it's
-254 bytes, and it's mostly wasted (only a few keys are ever held at once). In
-the rewrite, **shrink it** — e.g. track a small fixed-size set of currently-held
-keys with timestamps, or a coarse `uint8` tick, rather than a full per-key
-array. `frameBuffers[2][204]` = 408 bytes is the other big block. Keep total
-SRAM well under the 2 KB limit or the stack will collide with globals (which
-looks exactly like "random garbage / not running").
-
 ## Suggested execution phases
 
 - **Phase 1 — scaffolding:** define the frame/word/clock enums and counters,

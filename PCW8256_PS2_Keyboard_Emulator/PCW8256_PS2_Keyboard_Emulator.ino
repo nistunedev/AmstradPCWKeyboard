@@ -48,7 +48,7 @@
 // words back-to-back with no preamble). Diagnostic for whether the preamble's
 // DATA edges are the source of the intermittent last-bit (value bit 0) latches
 // seen on real hardware. Set 0 for the normal per-word preamble.
-#define DIAG_DISABLE_WORD_PREAMBLE 1
+#define DIAG_DISABLE_WORD_PREAMBLE 0
 // Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
 // DATA never toggles. Use to test whether CLK timing irregularities are
 // correlated with DATA transitions (e.g. simultaneous-switching noise
@@ -181,19 +181,18 @@ constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY hear
 
 constexpr uint16_t TIMER1_PRESCALER = 8;  // Timer1 clock/8, giving TIMER1_COUNTS_PER_US counts per microsecond
 constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;  // Timer1 ticks per microsecond
-constexpr uint8_t PCW_CLOCK_HIGH_US = 12;  // total CLK-high duration per bit
-constexpr uint8_t PCW_CLOCK_LOW_US = 21;  // normal CLK-low duration per bit
-constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse the old skip omitted
-// All 12 pulses are sent, but the LOW after the 4th pulse (i.e. after bit
-// index 3) is stretched to ~48us — the "48us gap after the fourth clock
-// pulse" James measured. The gate array appears to use this longer low as
-// the per-word sync marker. PCW_WORD_LONG_LOW_BIT is the 0-indexed bit whose
-// following low is extended (bit 3 = the 4th pulse).
-constexpr uint8_t PCW_CLOCK_LONG_LOW_US = 48;  // extended CLK-low after the 4th pulse of each word
-constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // low following this bit's pulse is the long one
-constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
-constexpr uint8_t PCW_PREAMBLE_PULSE_US = 6;  // each pre-word DATA half-pulse (high/low/high/low), CLK low, matching the real keyboard
-constexpr uint8_t PCW_PREAMBLE_TAIL_US = 30;  // DATA held low after the preamble before CLK rises
+constexpr uint8_t PCW_TICK_US = 6;  // one fixed Timer1 state-machine tick
+constexpr uint16_t PCW_FRAME_GAP_TICKS = 1040;  // 1040 * 6us = 6.24ms inter-frame low/low idle
+constexpr uint8_t PCW_PREAMBLE_TICKS = 8;  // DATA: low, high, low, high, low, low, low, low
+constexpr uint8_t PCW_CLOCK_STEPS_PER_BIT = 6;  // 12us high + 24us low on a 6us grid
+constexpr uint8_t PCW_CLOCK_LONG_LOW_STEPS_PER_BIT = 10;  // 12us high + 48us low after the marker pulse
+constexpr uint8_t PCW_CLOCK_DATA_STEP = 1;  // update DATA in the middle of the 12us CLK-high window
+constexpr uint8_t PCW_CLOCK_FALL_STEP = 2;  // falling edge latches DATA into the PCW gate array
+constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // stretch the low after the 4th clock pulse as the per-word marker
+constexpr uint8_t PCW_INTER_WORD_GAP_TICKS = 24;  // 24 * 6us = 144us gap between words
+constexpr uint8_t PCW_TICK_COUNTS = (PCW_TICK_US * TIMER1_COUNTS_PER_US);  // Timer1 counts per 6us tick
+constexpr uint8_t PCW_CLOCK_HIGH_US = PCW_TICK_US * 2U;  // DIAG_CLK_TIMING_TEST compatibility
+constexpr uint8_t PCW_CLOCK_LOW_US = PCW_TICK_US * 4U;  // DIAG_CLK_TIMING_TEST compatibility
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -368,18 +367,15 @@ struct PcwKeyMatrixEntry
   PcwMatrixEntry matrix;  // where that key's bit lives in pcwState
 };
 
-// Transmitter bit-clock state machine, driven one step per Timer1 compare.
-// Each 12-bit word is preceded by a DATA-only preamble emitted inside one ISR
-// entry: DATA high/low/high/low at 6us intervals while CLK stays low, then a
-// tail hold. Data bits keep the lower-ISR-load two-phase timing: ClockRise sets
-// CLK high and DATA, ClockFall drops CLK to latch and schedules the low period.
-enum class TxPhase : uint8_t
+// Fixed-tick PCW transmitter state machine. Timer1 fires every 6us; the ISR
+// only advances these counters and toggles pins. No variable OCR scheduling and
+// no busy-waits are used in the transmit path.
+enum class TxState : uint8_t
 {
-  FrameGap = 0,
-  PreambleBurst = 1,  // DATA high/low/high/low at 6us intervals, CLK low
-  PreambleTail = 2,   // DATA held low, PCW_PREAMBLE_TAIL_US, then CLK rises
-  ClockRise = 3,      // CLK high + set this bit's DATA, hold the 12us high
-  ClockFall = 4       // CLK low (latch), advance, then the CLK-low period
+  InterFrame = 0,
+  Preamble = 1,
+  ClockBits = 2,
+  InterWordGap = 3
 };
 
 volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per memory-map offset
@@ -393,12 +389,19 @@ volatile uint8_t pendingFrameIndex = 0;  // index of a freshly built frame waiti
 volatile bool pendingFrameReady = false;  // true when pendingFrameIndex holds a frame ready to swap in
 volatile bool pcwUpdateToggle = false;  // flips every transmitted frame so the PCW can detect new vs repeat
 volatile uint16_t txBitIndex = 0;  // index of the next bit to transmit within the active frame buffer
+volatile uint8_t txWordIndex = 0;  // 0..16 word currently being transmitted
+volatile uint8_t txWordPhaseTick = 0;  // tick within the preamble state for this word
 volatile uint8_t txBitInWord = 0;  // position (0-11) within the current 12-bit word being transmitted
-volatile TxPhase txPhase = TxPhase::FrameGap;  // current state of the transmitter's ISR-driven bit clock
+volatile uint8_t txClockStep = 0;  // 0..5 sub-step within the current bit slot
+volatile uint8_t txInterWordGapTicks = 0;  // 0..23 tick counter for the 144us inter-word gap
+volatile uint16_t txInterFrameTicks = 0;  // 0..1039 tick counter for the 6.24ms inter-frame gap
+volatile TxState txState = TxState::InterFrame;  // current fixed-tick transmitter state
 volatile bool pcwDataLineHigh = false;  // tracked physical DATA level, used for the pre-word pulses
 
 uint8_t frameBuffers[2][PCW_FRAME_BITS];  // double-buffered serialized frame bits, one byte (0/1) per bit
 uint16_t frameLengths[2] = {0, 0};  // bit length of each frameBuffers[] slot; 0 means "not yet built"
+uint8_t * volatile txFrameBits = frameBuffers[0];  // active frame buffer cached for the Timer1 ISR
+volatile uint16_t txFrameLength = 0;  // active frame bit length cached for the Timer1 ISR
 
 uint8_t buildFrameIndex = 0;  // index of the frameBuffers[] slot currently being constructed
 uint16_t buildBitCount = 0;  // number of bits written so far into the frame being built
@@ -561,17 +564,88 @@ inline void pcwLinesIdle()
 #endif
 }
 
-// Sets the length of the NEXT Timer1 interval by writing OCR1A only. In CTC
-// mode the hardware clears TCNT1 to 0 at each compare match, so the interval
-// is measured from that match — NOT from when this runs inside the ISR. That
-// keeps pulse widths exact regardless of how much work the ISR does before
-// calling this (unlike zeroing TCNT1 here, which folded the ISR's own run
-// time into the interval and stretched every low period). Safe because every
-// interval used here (>= PCW_CLOCK_HIGH_US = 24 ticks) is far larger than the
-// ISR-entry latency, so the new OCR1A is never already behind TCNT1.
-inline void scheduleTimer1Us(uint16_t microseconds)
+// Fast direct-port operations for the Timer1 ISR. These intentionally do not
+// update pcwDataLineHigh and are macros rather than helpers, because the 6us
+// state-machine tick cannot afford call/return or helper-side bookkeeping.
+#if PCW_INVERT_CLK
+#define PCW_CLK_HIGH_FAST() (PORTD &= static_cast<uint8_t>(~_BV(PD3)))
+#define PCW_CLK_LOW_FAST()  (PORTD |= _BV(PD3))
+#define DIAG_CLK_HIGH_FAST() (PORTD &= static_cast<uint8_t>(~_BV(PD6)))
+#define DIAG_CLK_LOW_FAST()  (PORTD |= _BV(PD6))
+#else
+#define PCW_CLK_HIGH_FAST() (PORTD |= _BV(PD3))
+#define PCW_CLK_LOW_FAST()  (PORTD &= static_cast<uint8_t>(~_BV(PD3)))
+#define DIAG_CLK_HIGH_FAST() (PORTD |= _BV(PD6))
+#define DIAG_CLK_LOW_FAST()  (PORTD &= static_cast<uint8_t>(~_BV(PD6)))
+#endif
+
+#if PCW_INVERT_DATA
+#define PCW_DATA_HIGH_FAST() (PORTD &= static_cast<uint8_t>(~_BV(PD5)))
+#define PCW_DATA_LOW_FAST()  (PORTD |= _BV(PD5))
+#else
+#define PCW_DATA_HIGH_FAST() (PORTD |= _BV(PD5))
+#define PCW_DATA_LOW_FAST()  (PORTD &= static_cast<uint8_t>(~_BV(PD5)))
+#endif
+
+#define PCW_LINES_IDLE_FAST() \
+  do \
+  { \
+    if (PCW_IDLE_HIGH) \
+    { \
+      PCW_CLK_HIGH_FAST(); \
+      DIAG_CLK_HIGH_FAST(); \
+      PCW_DATA_HIGH_FAST(); \
+    } \
+    else \
+    { \
+      PCW_CLK_LOW_FAST(); \
+      DIAG_CLK_LOW_FAST(); \
+      PCW_DATA_LOW_FAST(); \
+    } \
+  } while (0)
+
+#define PCW_MASK_INPUT_IRQS_FAST() \
+  do \
+  { \
+    EIMSK &= static_cast<uint8_t>(~_BV(INT0)); \
+    TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0)); \
+  } while (0)
+
+#define PCW_UNMASK_INPUT_IRQS_FAST() \
+  do \
+  { \
+    EIMSK |= _BV(INT0); \
+    if (!DIAG_DISABLE_TIMER0_IRQ) \
+    { \
+      TIMSK0 |= _BV(TOIE0); \
+    } \
+  } while (0)
+inline void maskPs2AndTimer0DuringPcwTransmit()
 {
-  OCR1A = static_cast<uint16_t>((microseconds * TIMER1_COUNTS_PER_US) - 1U);
+#if DIAG_FULL_EMULATOR
+  EIMSK &= static_cast<uint8_t>(~_BV(INT0));
+  TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0));
+#endif
+}
+
+inline void unmaskPs2AndTimer0DuringPcwGap()
+{
+#if DIAG_FULL_EMULATOR
+  EIMSK |= _BV(INT0);
+  TIMSK0 |= _BV(TOIE0);
+#endif
+}
+
+inline void resetPcwTransmitterCounters()
+{
+  txBitIndex = 0;
+  txWordIndex = 0;
+  txWordPhaseTick = 0;
+  txBitInWord = 0;
+  txClockStep = 0;
+  txInterWordGapTicks = 0;
+  txInterFrameTicks = 0;
+  txState = TxState::InterFrame;
 }
 
 // Resets the PCW state buffer, key hold counters, and PS/2 held-key bitmap
@@ -979,9 +1053,9 @@ void sendPcwFrame()
   if (frameLengths[activeFrameIndex] == 0)
   {
     activeFrameIndex = buildFrameIndex;
-    txBitIndex = 0;
-    txBitInWord = 0;
-    txPhase = TxPhase::FrameGap;
+    txFrameBits = frameBuffers[activeFrameIndex];
+    txFrameLength = frameLengths[activeFrameIndex];
+    resetPcwTransmitterCounters();
   }
   else
   {
@@ -1262,8 +1336,9 @@ void releaseStuckKeys()
   }
 }
 
-// Configures Timer1 in CTC mode (prescaler /8) and arms the first compare
-// match, starting the transmitter's ISR-driven bit clock.
+// Configures Timer1 in CTC mode (prescaler /8) with one fixed 6us compare
+// interval. The ISR never changes OCR1A; all PCW waveform timing is derived
+// from tick counters in the state machine below.
 void setupTimer1()
 {
   cli();
@@ -1271,162 +1346,208 @@ void setupTimer1()
   TCCR1B = 0;
   TCCR1B |= _BV(WGM12);
   TCCR1B |= _BV(CS11);
-  TCNT1 = 0;  // one-time clean start; thereafter CTC auto-resets at each match
-  scheduleTimer1Us(PCW_CLOCK_HIGH_US);
+  OCR1A = static_cast<uint16_t>(PCW_TICK_COUNTS - 1U);
+  TCNT1 = 0;
   TIMSK1 |= _BV(OCIE1A);
   sei();
 }
 
-// Main transmitter state machine, one step per Timer1 compare-match. Each
-// word is preceded by a DATA-only preamble emitted as one ISR burst: DATA
-// high/low/high/low in PCW_PREAMBLE_PULSE_US busy-waited steps while CLK stays
-// low, then a PCW_PREAMBLE_TAIL_US hold. Data bits stay two-phase to avoid
-// blocking PS/2 receive for the full 12us high on every bit: ClockRise raises
-// CLK and loads DATA, ClockFall drops CLK to latch and schedules the low period.
-// The D6 mirror pulses every bit as an analyser reference. FrameGap holds the
-// lines idle during the inter-frame gap; its timer firing starts the first
-// word's preamble.
+inline void beginInterFrameGap()
+{
+  pcwLinesIdle();
+  unmaskPs2AndTimer0DuringPcwGap();
+  txInterFrameTicks = 0;
+  txState = TxState::InterFrame;
+}
+
+inline void beginWordPreamble()
+{
+  maskPs2AndTimer0DuringPcwTransmit();
+  pcwClockLow();
+  diagClockLow();
+  pcwDataLow();
+  txWordPhaseTick = 0;
+  txState = TxState::Preamble;
+}
+
+inline void advanceCompletedFrame()
+{
+  txBitIndex = 0;
+  txWordIndex = 0;
+  txBitInWord = 0;
+  txClockStep = 0;
+  pcwUpdateToggle = !pcwUpdateToggle;
+  if (pendingFrameReady)
+  {
+    activeFrameIndex = pendingFrameIndex;
+    pendingFrameReady = false;
+  }
+
+  const uint8_t nextFrame = activeFrameIndex;
+  txFrameBits = frameBuffers[nextFrame];
+  txFrameLength = frameLengths[nextFrame];
+  const uint8_t toggleBit = pcwUpdateToggle ? 1 : 0;
+  frameBuffers[nextFrame][PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+  frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * PCW_BITS_PER_WORD +
+                           PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+  beginInterFrameGap();
+}
+
+// Main transmitter state machine, one fixed 6us tick per Timer1 compare-match.
+// The per-tick path is deliberately flat: direct PORTD operations, no helper
+// calls, and interrupt masks only at frame/word transitions.
 ISR(TIMER1_COMPA_vect)
 {
-  const uint8_t currentFrame = activeFrameIndex;
-  const uint16_t frameLength = frameLengths[currentFrame];
-
-  if (frameLength == 0)
+  if (txFrameLength == 0)
   {
-    pcwLinesIdle();
+    PCW_LINES_IDLE_FAST();
+    PCW_UNMASK_INPUT_IRQS_FAST();
     return;
   }
 
-  switch (txPhase)
+  switch (txState)
   {
-    case TxPhase::FrameGap:
-      // Start of a frame = start of the first word's preamble.
-      pcwClockLow();
-      diagClockLow();
+    case TxState::InterFrame:
+      PCW_LINES_IDLE_FAST();
+      ++txInterFrameTicks;
+      if (txInterFrameTicks >= PCW_FRAME_GAP_TICKS)
+      {
+        PCW_MASK_INPUT_IRQS_FAST();
+        PCW_CLK_LOW_FAST();
+        DIAG_CLK_LOW_FAST();
+        PCW_DATA_LOW_FAST();
+        txWordPhaseTick = 0;
+        txState = TxState::Preamble;
+      }
+      break;
+
+    case TxState::Preamble:
 #if DIAG_DISABLE_WORD_PREAMBLE
-      // No preamble: raise CLK and set bit 0's DATA, straight into its high.
-      pcwClockHigh();
-      diagClockHigh();
-      loadCurrentPcwData();
-      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-      txPhase = TxPhase::ClockFall;
+      txWordPhaseTick = 0;
+      txClockStep = 0;
+      txState = TxState::ClockBits;
 #else
-      pcwDataLow();  // preamble begins from a low DATA level ("1. low")
-      scheduleTimer1Us(PCW_CLOCK_LOW_US);
-      txPhase = TxPhase::PreambleBurst;
-#endif
-      break;
-
-    case TxPhase::PreambleBurst:
-      pcwDataHigh();
-      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
-      pcwDataLow();
-      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
-      pcwDataHigh();
-      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
-      pcwDataLow();
-      delayMicroseconds(PCW_PREAMBLE_PULSE_US);
-      scheduleTimer1Us(PCW_PREAMBLE_TAIL_US);
-      txPhase = TxPhase::PreambleTail;
-      break;
-
-    case TxPhase::PreambleTail:
-      // DATA stayed low for the scheduled tail; now raise CLK for the first bit.
-      txPhase = TxPhase::ClockRise;
-      // fall through into ClockRise
-
-    case TxPhase::ClockRise:
-      // Raise CLK and set this bit's DATA together. Keeping this as a scheduled
-      // 12us high (rather than a busy-waited mid-high transition) avoids holding
-      // interrupts off for every bit, which regressed PS/2 break detection.
-      diagClockHigh();
-      pcwClockHigh();
-      loadCurrentPcwData();
-      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-      txPhase = TxPhase::ClockFall;
-      break;
-
-    case TxPhase::ClockFall:
-    {
-      pcwClockLow();
-      diagClockLow();
-      const uint8_t justLatched = txBitInWord;  // bit whose falling edge just occurred
-      ++txBitIndex;
-      ++txBitInWord;
-      if (txBitInWord >= PCW_BITS_PER_WORD)
+      if (txWordPhaseTick == 1 || txWordPhaseTick == 3)
       {
-        txBitInWord = 0;
-      }
-      if (txBitIndex >= frameLength)
-      {
-        // Frame complete. The update-toggle bit must flip every frame (even
-        // if key state didn't change) so the PCW can tell "new frame" from
-        // "same frame repeated". It's patched directly into the two words
-        // that carry it (the first and last word of the frame, both offset
-        // 0x0F, per the packet order in PCW_PROTOCOL_HANDOFF.md) rather
-        // than triggering a full rebuild, and it's done here rather than
-        // in loop()'s sendPcwFrame() so it stays synchronized with this
-        // same frame-swap moment — deferring it risks the ISR starting to
-        // transmit the new frame before loop() has updated the toggle bit.
-        txBitIndex = 0;
-        txBitInWord = 0;
-        pcwUpdateToggle = !pcwUpdateToggle;
-        if (pendingFrameReady)
-        {
-          activeFrameIndex = pendingFrameIndex;
-          pendingFrameReady = false;
-        }
-
-        const uint8_t nextFrame = activeFrameIndex;
-        const uint8_t toggleBit = pcwUpdateToggle ? 1 : 0;
-        frameBuffers[nextFrame][PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
-        frameBuffers[nextFrame][(PCW_FRAME_WORDS - 1U) * PCW_BITS_PER_WORD +
-                                 PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
-        // Release the lines to the idle level for the inter-frame gap. The
-        // last bit was already latched on its falling edge above.
-        pcwLinesIdle();
-        scheduleTimer1Us(PCW_FRAME_GAP_US);
-        txPhase = TxPhase::FrameGap;
-        break;
-      }
-
-      // The low following the 4th pulse (bit 3) is stretched to ~48us as the
-      // per-word sync marker; every other low is the normal ~21us.
-      uint16_t lowUs = PCW_CLOCK_LOW_US;
-#if !DIAG_DISABLE_WORD_SKIP
-      if (justLatched == PCW_WORD_LONG_LOW_BIT)
-      {
-        lowUs = PCW_CLOCK_LONG_LOW_US;
-      }
-#endif
-      if (txBitInWord == 0)
-      {
-        // Word boundary: DATA holds the just-latched last bit through this low.
-#if DIAG_DISABLE_WORD_PREAMBLE
-        scheduleTimer1Us(lowUs);
-        txPhase = TxPhase::ClockRise;
-#else
-        pcwDataLow();  // preamble begins from a low DATA level ("1. low")
-        scheduleTimer1Us(lowUs);
-        txPhase = TxPhase::PreambleBurst;
-#endif
+        PCW_DATA_HIGH_FAST();
       }
       else
       {
-        // DATA holds the just-latched bit's level through the low; the next
-        // bit's DATA is set in ClockRise, just after CLK rises.
-        scheduleTimer1Us(lowUs);
-        txPhase = TxPhase::ClockRise;
+        PCW_DATA_LOW_FAST();
+      }
+      ++txWordPhaseTick;
+      if (txWordPhaseTick >= PCW_PREAMBLE_TICKS)
+      {
+        txClockStep = 0;
+        txState = TxState::ClockBits;
+      }
+#endif
+      break;
+
+    case TxState::ClockBits:
+    {
+      const bool longLowThisBit = !DIAG_DISABLE_WORD_SKIP &&
+                                  txBitInWord == PCW_WORD_LONG_LOW_BIT;
+      const uint8_t bitSlotTicks = longLowThisBit ?
+          PCW_CLOCK_LONG_LOW_STEPS_PER_BIT : PCW_CLOCK_STEPS_PER_BIT;
+
+      if (txClockStep == 0)
+      {
+        PCW_CLK_HIGH_FAST();
+        DIAG_CLK_HIGH_FAST();
+      }
+      else if (txClockStep == PCW_CLOCK_DATA_STEP)
+      {
+#if DIAG_FORCE_DATA_LOW
+        PCW_DATA_LOW_FAST();
+#else
+        const uint8_t bitValue = txFrameBits[txBitIndex];
+        if (bitValue)
+        {
+          PCW_DATA_HIGH_FAST();
+        }
+        else
+        {
+          PCW_DATA_LOW_FAST();
+        }
+#endif
+      }
+      else if (txClockStep == PCW_CLOCK_FALL_STEP)
+      {
+        PCW_CLK_LOW_FAST();
+        DIAG_CLK_LOW_FAST();
+        ++txBitIndex;
+        ++txBitInWord;
+        if (txBitInWord >= PCW_BITS_PER_WORD)
+        {
+          txBitInWord = 0;
+          ++txWordIndex;
+        }
+      }
+
+      ++txClockStep;
+      if (txClockStep >= bitSlotTicks)
+      {
+        txClockStep = 0;
+        if (txBitIndex >= txFrameLength)
+        {
+          txBitIndex = 0;
+          txWordIndex = 0;
+          txBitInWord = 0;
+          txClockStep = 0;
+          pcwUpdateToggle = !pcwUpdateToggle;
+          if (pendingFrameReady)
+          {
+            activeFrameIndex = pendingFrameIndex;
+            pendingFrameReady = false;
+          }
+
+          const uint8_t nextFrame = activeFrameIndex;
+          txFrameBits = frameBuffers[nextFrame];
+          txFrameLength = frameLengths[nextFrame];
+          const uint8_t toggleBit = pcwUpdateToggle ? 1 : 0;
+          txFrameBits[PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+          txFrameBits[(PCW_FRAME_WORDS - 1U) * PCW_BITS_PER_WORD +
+                      PCW_UPDATE_TOGGLE_BIT_INDEX] = toggleBit;
+          PCW_LINES_IDLE_FAST();
+          PCW_UNMASK_INPUT_IRQS_FAST();
+          txInterFrameTicks = 0;
+          txState = TxState::InterFrame;
+        }
+        else if (txBitInWord == 0)
+        {
+          PCW_DATA_LOW_FAST();
+          txInterWordGapTicks = 0;
+          txState = TxState::InterWordGap;
+        }
       }
       break;
     }
 
+    case TxState::InterWordGap:
+      PCW_CLK_LOW_FAST();
+      DIAG_CLK_LOW_FAST();
+      PCW_DATA_LOW_FAST();
+      ++txInterWordGapTicks;
+      if (txInterWordGapTicks >= PCW_INTER_WORD_GAP_TICKS)
+      {
+        PCW_DATA_LOW_FAST();
+        txWordPhaseTick = 0;
+        txState = TxState::Preamble;
+      }
+      break;
+
     default:
-      // Defensive recovery in case txPhase ever holds an unexpected value:
-      // hold the lines idle and restart from the beginning of a bit.
-      pcwLinesIdle();
-      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-      txPhase = TxPhase::FrameGap;
+      txBitIndex = 0;
+      txWordIndex = 0;
+      txWordPhaseTick = 0;
+      txBitInWord = 0;
+      txClockStep = 0;
+      txInterWordGapTicks = 0;
+      txInterFrameTicks = 0;
+      txState = TxState::InterFrame;
+      PCW_LINES_IDLE_FAST();
+      PCW_UNMASK_INPUT_IRQS_FAST();
       break;
   }
 }
