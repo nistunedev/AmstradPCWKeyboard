@@ -332,6 +332,7 @@ uint8_t ps2Held[PS2_HELD_BITMAP_BYTES];  // bitmap of PS/2 scancodes currently h
 uint8_t holdCount[PCW_KEY_COUNT];  // per-PcwKey ref count of PS/2 codes mapped to it, for overlap-safe release
 uint16_t keyLastMakeMs[PCW_KEY_COUNT];  // millis() (16-bit) of the last make per held PcwKey; drives dropped-break auto-release
 bool shiftedDotHeldAsGreater = false;  // tracks PS/2 Shift+. remapped to the PCW #/> physical key until release
+bool commaHeldWithSynthShift = false;  // tracks PS/2 comma (unshifted) held as PCW Shift+apostrophe (a synthetic-Shift ','), until release
 volatile bool frameDirty = false;  // true when pcwState changed since the last frame was built
 
 volatile uint8_t activeFrameIndex = 0;  // index (0 or 1) of frameBuffers[] currently being transmitted
@@ -835,7 +836,9 @@ const KeyMapEntry kKeyMap[] PROGMEM = {
   {PS2_KEY_SINGLE, PCW_KEY_HALF},
   {PS2_KEY_COMMA, PCW_KEY_POUND},
   {PS2_KEY_DOT, PCW_KEY_DOTS},
-  {PS2_KEY_BACK, PCW_KEY_HASH},
+  // PS/2 backslash key: '\' -> PCW slash-position key, '|' via forwarded Shift
+  // (was PCW_KEY_HASH, which produced '#'/'>').
+  {PS2_KEY_BACK, PCW_KEY_SLASH},
   {PS2_KEY_L_SHIFT, PCW_KEY_SHIFT},
   {PS2_KEY_R_SHIFT, PCW_KEY_SHIFT},
   {PS2_KEY_Z, PCW_KEY_Z},
@@ -1146,6 +1149,41 @@ bool readKeyboardEvent(KeyEvent &event)
   return false;
 }
 
+// Make/break a PcwKey through the shared holdCount[] refcount (same logic the
+// main key path uses), so a key driven from more than one source composes
+// correctly and is only physically released once every source is up. Used for
+// the synthetic Shift a comma injects alongside a possible real Shift.
+void applyKeyRefCounted(PcwKey key, bool pressed)
+{
+  const uint8_t idx = static_cast<uint8_t>(key);
+  if (idx >= PCW_KEY_COUNT)
+  {
+    return;
+  }
+  if (pressed)
+  {
+    if (holdCount[idx] == 0)
+    {
+      applyKeyState(key, true);
+    }
+    if (holdCount[idx] < PCW_HOLD_COUNT_MAX)
+    {
+      ++holdCount[idx];
+    }
+  }
+  else
+  {
+    if (holdCount[idx] > 0)
+    {
+      --holdCount[idx];
+      if (holdCount[idx] == 0)
+      {
+        applyKeyState(key, false);
+      }
+    }
+  }
+}
+
 // Applies one PS/2 key event to the PCW state: handles typematic-repeat
 // suppression, Shift/Shift Lock interaction, maps the PS/2 code to a PcwKey
 // via kKeyMap, and applies make/break through applyKeyState() with hold
@@ -1183,6 +1221,22 @@ void updatePcwState(const KeyEvent &event)
     if (shiftedDotHeldAsGreater)
     {
       entry.key = PCW_KEY_HASH;
+    }
+  }
+  // PCW ',' lives on the apostrophe-position key as Shift+apostrophe. When the
+  // PS/2 comma is pressed WITHOUT Shift, emit that: remap to PCW_KEY_APOSTROPHE
+  // and inject a synthetic Shift below. With Shift held it is PS/2 '<', which
+  // the PCW makes as (real) Shift + POUND via the default kKeyMap entry, so that
+  // path is left untouched.
+  if (mapped && ps2Code == PS2_KEY_COMMA)
+  {
+    if (event.pressed && ((event.raw & PS2_SHIFT) == 0))
+    {
+      commaHeldWithSynthShift = true;
+    }
+    if (commaHeldWithSynthShift)
+    {
+      entry.key = PCW_KEY_APOSTROPHE;
     }
   }
   const uint8_t keyIndex =
@@ -1243,6 +1297,14 @@ void updatePcwState(const KeyEvent &event)
       interrupts();
     }
 
+    // Inject the synthetic Shift for an unshifted comma alongside the remapped
+    // apostrophe make. Ref-counted so it composes with a real Shift and only
+    // drops once both are released.
+    if (ps2Code == PS2_KEY_COMMA && commaHeldWithSynthShift)
+    {
+      applyKeyRefCounted(PCW_KEY_SHIFT, true);
+    }
+
     if (holdCount[keyIndex] == 0)
     {
       applyKeyState(entry.key, true);
@@ -1266,6 +1328,13 @@ void updatePcwState(const KeyEvent &event)
     if (ps2Code == PS2_KEY_DOT)
     {
       shiftedDotHeldAsGreater = false;
+    }
+    if (ps2Code == PS2_KEY_COMMA && commaHeldWithSynthShift)
+    {
+      // Release the synthetic Shift paired with this comma (real Shift, if any,
+      // stays held via its own refcount).
+      applyKeyRefCounted(PCW_KEY_SHIFT, false);
+      commaHeldWithSynthShift = false;
     }
   }
 }
