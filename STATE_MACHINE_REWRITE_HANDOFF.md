@@ -74,20 +74,41 @@ but confirm on the analyser.
 5. CLK low
 6. CLK low
 → next bit
-Special case: **the 4th clock pulse has no 12µs gap** — after the 4th bit
-(bit index 3) extend the low (48µs = 8 low ticks instead of 4). Add an explicit
-branch keyed on the within-word bit index.
+Special case — **4th clock pulse: omit its HIGH phase** (decision 4). For the
+bit whose pulse is the 4th, skip clock-steps 1–2 (CLK stays low) so its low
+merges with the surrounding lows into the extended low James measured. Keyed on
+the within-word bit index (confirm index 3 vs 4 against the trace).
 
-## Open items to resolve while coding
+## Confirmed decisions (user's scope + James Ols' trace) — build to these
 
-1. Word count: emit 17 words (flag/offset/flag), not 13/16. Confirm vs ADR.
-2. PS/2 strategy: mask the PS/2 pin interrupt during active transmit and poll
-   the library only in `INTER_FRAME`; or accept unreliable input. A 6µs tick is
-   ~50% CPU, so PS/2 cannot run un-jittered during transmit on this MCU.
-3. 144µs inter-word gap: keep only if James's trace shows it.
-4. 4th-pulse long low: explicit bit-index-3 branch.
-5. Clock low 21µs → 24µs on the 6µs grid: confirm gate-array tolerance.
-6. Inter-frame gap: 1040 ticks vs one long interval.
+1. **Word count = 17.** `0xF` (transmit bit set), `0x00…0x0E`, `0xF` (transmit
+   bit clear). The D0–D15 counter walks the 16 offsets; emit `0xF` at both ends.
+2. **PS/2 is masked during transmit — accepted.** Mask the PS/2 pin interrupt
+   while a frame is clocking out; service/poll PS/2 only in `INTER_FRAME`. Input
+   may be missed or repeat — accepted tradeoff, not a bug to chase.
+3. **144µs inter-word gap is real** — James measured it on the scope. Keep the
+   24-tick (144µs) gap between words (word-state step 11).
+4. **4th clock pulse: extend the low by OMITTING that pulse's HIGH**, not by
+   lengthening a low count. For the 4th pulse, skip the CLK-high phase so its
+   low merges with the neighbouring lows into the extended low. (So there are
+   effectively 11 high edges in that word; the "missing" 4th high is the marker.)
+5. **Clock low = 24µs** (4 ticks on the 6µs grid; measured was 21.125µs). Hitting
+   21µs exactly would require a 3µs grid — deferred. Ship 24µs, re-evaluate on
+   the real PCW.
+6. **Inter-frame gap stays inside the tick state machine** — count 1040 × 6µs
+   ticks in `INTER_FRAME` with CLK/DATA low. Do NOT switch to one long timer.
+   Everything is purely clock-driven, mirroring the real keyboard's internal
+   processor. One fixed 6µs CTC tick drives the whole hierarchy.
+
+## RAM is TIGHT — ~4% free (≈96% used)
+
+`keyLastMakeMs[PCW_KEY_COUNT]` is the pressure: `PCW_KEY_COUNT = 127`, so it's
+254 bytes, and it's mostly wasted (only a few keys are ever held at once). In
+the rewrite, **shrink it** — e.g. track a small fixed-size set of currently-held
+keys with timestamps, or a coarse `uint8` tick, rather than a full per-key
+array. `frameBuffers[2][204]` = 408 bytes is the other big block. Keep total
+SRAM well under the 2 KB limit or the stack will collide with globals (which
+looks exactly like "random garbage / not running").
 
 ## Suggested execution phases
 
