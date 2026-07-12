@@ -141,6 +141,7 @@ constexpr uint8_t PCW_CLOCK_FALL_STEP = 2;  // falling edge latches DATA into th
 constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // stretch the low after the 4th clock pulse as the per-word marker
 constexpr uint8_t PCW_INTER_WORD_GAP_TICKS = 24;  // 24 * 6us = 144us gap between words
 constexpr uint8_t PCW_TICK_COUNTS = (PCW_TICK_US * TIMER1_COUNTS_PER_US);  // Timer1 counts per 6us tick
+constexpr uint16_t PCW_PS2_ACTIVITY_PAUSE_TICKS = 334;  // 334 * 6us ~= 2ms quiet PS/2 window before restarting PCW frames
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -343,6 +344,7 @@ volatile uint8_t txBitInWord = 0;  // position (0-11) within the current 12-bit 
 volatile uint8_t txClockStep = 0;  // 0..5 sub-step within the current bit slot
 volatile uint8_t txInterWordGapTicks = 0;  // 0..23 tick counter for the 144us inter-word gap
 volatile uint16_t txInterFrameTicks = 0;  // 0..1039 tick counter for the 6.24ms inter-frame gap
+volatile uint16_t txPs2ActivityPauseTicks = 0;  // extends inter-frame idle while PS/2 is actively clocking a byte
 volatile TxState txState = TxState::InterFrame;  // current fixed-tick transmitter state
 volatile bool pcwDataLineHigh = false;  // tracked physical DATA level, used for the pre-word pulses
 
@@ -424,7 +426,7 @@ bool isIgnoredPs2Code(uint8_t code)
 // Drives the real PCW CLK (D3) to its logical-high state (the bit's 12 us
 // high phase). Push-pull OUTPUT backed by an external 10k pull-up. When
 // PCW_INVERT_CLK is set the physical pin is driven LOW here so the path to
-// the PCW presents a high â€” see PCW_INVERT_CLK above.
+// the PCW presents a high ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â see PCW_INVERT_CLK above.
 inline void pcwClockHigh()
 {
 #if PCW_INVERT_CLK
@@ -446,7 +448,7 @@ inline void pcwClockLow()
 }
 
 // Drives the diagnostic CLK mirror (D6) high/low. D6 shows the clock WITHOUT
-// the per-word skip applied â€” a uniform reference every bit â€” so it can be
+// the per-word skip applied ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â a uniform reference every bit ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â so it can be
 // compared on the scope against the real D3 CLK, which does skip. Uses the
 // same PCW_INVERT_CLK polarity as D3 so the two read alike on the analyser.
 inline void diagClockHigh()
@@ -553,20 +555,43 @@ inline void pcwLinesIdle()
   } while (0)
 
 #if DIAG_FULL_EMULATOR
+#define PS2_CLK_INHIBIT_FAST() \
+  do \
+  { \
+    PORTD &= static_cast<uint8_t>(~_BV(PORTD2)); \
+    DDRD |= _BV(DDD2); \
+  } while (0)
+
+#define PS2_CLK_RELEASE_FAST() \
+  do \
+  { \
+    DDRD &= static_cast<uint8_t>(~_BV(DDD2)); \
+    PORTD |= _BV(PORTD2); \
+  } while (0)
+
+#define PS2_BUS_IDLE_FAST() ((PIND & (_BV(PD2) | _BV(PD4))) == (_BV(PD2) | _BV(PD4)))
+
 #define PCW_MASK_INPUT_IRQS_FAST() \
   do \
   { \
+    PS2_CLK_INHIBIT_FAST(); \
     EIMSK &= static_cast<uint8_t>(~_BV(INT0)); \
+    EIFR = _BV(INTF0); \
     TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0)); \
   } while (0)
 
 #define PCW_UNMASK_INPUT_IRQS_FAST() \
   do \
   { \
+    EIFR = _BV(INTF0); \
     EIMSK |= _BV(INT0); \
     TIMSK0 |= _BV(TOIE0); \
+    PS2_CLK_RELEASE_FAST(); \
   } while (0)
 #else
+#define PS2_CLK_INHIBIT_FAST() do {} while (0)
+#define PS2_CLK_RELEASE_FAST() do {} while (0)
+#define PS2_BUS_IDLE_FAST() true
 #define PCW_MASK_INPUT_IRQS_FAST() do {} while (0)
 #define PCW_UNMASK_INPUT_IRQS_FAST() do {} while (0)
 #endif
@@ -574,7 +599,9 @@ inline void pcwLinesIdle()
 inline void maskPs2AndTimer0DuringPcwTransmit()
 {
 #if DIAG_FULL_EMULATOR
+  PS2_CLK_INHIBIT_FAST();
   EIMSK &= static_cast<uint8_t>(~_BV(INT0));
+  EIFR = _BV(INTF0);
   TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0));
 #endif
 }
@@ -582,8 +609,10 @@ inline void maskPs2AndTimer0DuringPcwTransmit()
 inline void unmaskPs2AndTimer0DuringPcwGap()
 {
 #if DIAG_FULL_EMULATOR
+  EIFR = _BV(INTF0);
   EIMSK |= _BV(INT0);
   TIMSK0 |= _BV(TOIE0);
+  PS2_CLK_RELEASE_FAST();
 #endif
 }
 
@@ -596,6 +625,7 @@ inline void resetPcwTransmitterCounters()
   txClockStep = 0;
   txInterWordGapTicks = 0;
   txInterFrameTicks = 0;
+  txPs2ActivityPauseTicks = 0;
   txState = TxState::InterFrame;
 }
 
@@ -1300,6 +1330,7 @@ inline void beginInterFrameGap()
   pcwLinesIdle();
   unmaskPs2AndTimer0DuringPcwGap();
   txInterFrameTicks = 0;
+  txPs2ActivityPauseTicks = 0;
   txState = TxState::InterFrame;
 }
 
@@ -1352,8 +1383,19 @@ ISR(TIMER1_COMPA_vect)
   {
     case TxState::InterFrame:
       PCW_LINES_IDLE_FAST();
-      ++txInterFrameTicks;
-      if (txInterFrameTicks >= PCW_FRAME_GAP_TICKS)
+      if (!PS2_BUS_IDLE_FAST())
+      {
+        txPs2ActivityPauseTicks = PCW_PS2_ACTIVITY_PAUSE_TICKS;
+      }
+      else if (txPs2ActivityPauseTicks > 0)
+      {
+        --txPs2ActivityPauseTicks;
+      }
+      if (txInterFrameTicks < PCW_FRAME_GAP_TICKS)
+      {
+        ++txInterFrameTicks;
+      }
+      else if (txPs2ActivityPauseTicks == 0)
       {
         PCW_MASK_INPUT_IRQS_FAST();
         PCW_CLK_LOW_FAST();
