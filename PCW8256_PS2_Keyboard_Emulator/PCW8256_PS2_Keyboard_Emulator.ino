@@ -331,6 +331,7 @@ volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per me
 uint8_t ps2Held[PS2_HELD_BITMAP_BYTES];  // bitmap of PS/2 scancodes currently held (make seen, no break yet)
 uint8_t holdCount[PCW_KEY_COUNT];  // per-PcwKey ref count of PS/2 codes mapped to it, for overlap-safe release
 uint16_t keyLastMakeMs[PCW_KEY_COUNT];  // millis() (16-bit) of the last make per held PcwKey; drives dropped-break auto-release
+bool shiftedDotHeldAsGreater = false;  // tracks PS/2 Shift+. remapped to the PCW #/> physical key until release
 volatile bool frameDirty = false;  // true when pcwState changed since the last frame was built
 
 volatile uint8_t activeFrameIndex = 0;  // index (0 or 1) of frameBuffers[] currently being transmitted
@@ -426,7 +427,7 @@ bool isIgnoredPs2Code(uint8_t code)
 // Drives the real PCW CLK (D3) to its logical-high state (the bit's 12 us
 // high phase). Push-pull OUTPUT backed by an external 10k pull-up. When
 // PCW_INVERT_CLK is set the physical pin is driven LOW here so the path to
-// the PCW presents a high ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â see PCW_INVERT_CLK above.
+// the PCW presents a high level; see PCW_INVERT_CLK above.
 inline void pcwClockHigh()
 {
 #if PCW_INVERT_CLK
@@ -448,7 +449,7 @@ inline void pcwClockLow()
 }
 
 // Drives the diagnostic CLK mirror (D6) high/low. D6 shows the clock WITHOUT
-// the per-word skip applied ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â a uniform reference every bit ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â so it can be
+// the per-word skip applied, as a uniform reference every bit, so it can be
 // compared on the scope against the real D3 CLK, which does skip. Uses the
 // same PCW_INVERT_CLK polarity as D3 so the two read alike on the analyser.
 inline void diagClockHigh()
@@ -792,17 +793,17 @@ const PcwKeyMatrixEntry kPcwJoystickMatrix[] PROGMEM = {
 };
 
 const KeyMapEntry kKeyMap[] PROGMEM = {
-  {PS2_KEY_ESC, PCW_KEY_EXIT},
-  {PS2_KEY_1, PCW_KEY_1},
-  {PS2_KEY_2, PCW_KEY_2},
-  {PS2_KEY_3, PCW_KEY_3},
-  {PS2_KEY_4, PCW_KEY_4},
-  {PS2_KEY_5, PCW_KEY_5},
-  {PS2_KEY_6, PCW_KEY_6},
-  {PS2_KEY_7, PCW_KEY_7},
-  {PS2_KEY_8, PCW_KEY_8},
-  {PS2_KEY_9, PCW_KEY_9},
-  {PS2_KEY_0, PCW_KEY_0},
+  {PS2_KEY_ESC, PCW_KEY_STOP},
+  {PS2_KEY_1, PCW_KEY_KP_1},
+  {PS2_KEY_2, PCW_KEY_KP_2},
+  {PS2_KEY_3, PCW_KEY_KP_3},
+  {PS2_KEY_4, PCW_KEY_KP_4},
+  {PS2_KEY_5, PCW_KEY_KP_5},
+  {PS2_KEY_6, PCW_KEY_KP_6},
+  {PS2_KEY_7, PCW_KEY_KP_7},
+  {PS2_KEY_8, PCW_KEY_KP_8},
+  {PS2_KEY_9, PCW_KEY_KP_9},
+  {PS2_KEY_0, PCW_KEY_KP_0},
   {PS2_KEY_TAB, PCW_KEY_TAB},
   {PS2_KEY_Q, PCW_KEY_Q},
   {PS2_KEY_W, PCW_KEY_W},
@@ -816,7 +817,7 @@ const KeyMapEntry kKeyMap[] PROGMEM = {
   {PS2_KEY_P, PCW_KEY_P},
   {PS2_KEY_OPEN_SQ, PCW_KEY_OPEN_BRACKET},
   {PS2_KEY_CLOSE_SQ, PCW_KEY_CLOSE_BRACKET},
-  {PS2_KEY_ENTER, PCW_KEY_ENTER},
+  {PS2_KEY_ENTER, PCW_KEY_RETURN},
   // The current PCW matrix table has no dedicated Control entry.
   {PS2_KEY_L_CTRL, PCW_KEY_EXTRA},
   {PS2_KEY_R_CTRL, PCW_KEY_EXTRA},
@@ -831,6 +832,10 @@ const KeyMapEntry kKeyMap[] PROGMEM = {
   {PS2_KEY_L, PCW_KEY_L},
   {PS2_KEY_SEMI, PCW_KEY_SEMICOLON},
   {PS2_KEY_APOS, PCW_KEY_APOSTROPHE},
+  {PS2_KEY_SINGLE, PCW_KEY_HALF},
+  {PS2_KEY_COMMA, PCW_KEY_POUND},
+  {PS2_KEY_DOT, PCW_KEY_DOTS},
+  {PS2_KEY_BACK, PCW_KEY_HASH},
   {PS2_KEY_L_SHIFT, PCW_KEY_SHIFT},
   {PS2_KEY_R_SHIFT, PCW_KEY_SHIFT},
   {PS2_KEY_Z, PCW_KEY_Z},
@@ -862,8 +867,6 @@ const KeyMapEntry kKeyMap[] PROGMEM = {
   {PS2_KEY_SCROLL, PCW_KEY_HALF},
   {PS2_KEY_PRTSCR, PCW_KEY_PTR},
   {PS2_KEY_PAUSE, PCW_KEY_CAN},
-  {PS2_KEY_L_GUI, PCW_KEY_EXCH_FIND},
-  {PS2_KEY_R_GUI, PCW_KEY_EXCH_FIND},
   {PS2_KEY_UP_ARROW, PCW_KEY_CURSOR_UP},
   {PS2_KEY_DN_ARROW, PCW_KEY_CURSOR_DOWN},
   {PS2_KEY_L_ARROW, PCW_KEY_CURSOR_LEFT},
@@ -885,7 +888,8 @@ const KeyMapEntry kKeyMap[] PROGMEM = {
   {PS2_KEY_KP7, PCW_KEY_KP_7},
   {PS2_KEY_KP8, PCW_KEY_KP_8},
   {PS2_KEY_KP9, PCW_KEY_KP_9},
-  {PS2_KEY_KP_ENTER, PCW_KEY_ENTER}
+  {PS2_KEY_KP_DOT, PCW_KEY_DOTS},
+  {PS2_KEY_KP_ENTER, PCW_KEY_RETURN}
 };
 
 constexpr uint16_t kPcwKeyboardMatrixCount = sizeof(kPcwKeyboardMatrix) / sizeof(kPcwKeyboardMatrix[0]);
@@ -1170,6 +1174,17 @@ void updatePcwState(const KeyEvent &event)
 
   KeyMapEntry entry;
   const bool mapped = findKeyMapEntry(event.code, entry);
+  if (mapped && ps2Code == PS2_KEY_DOT)
+  {
+    if (event.pressed && ((event.raw & PS2_SHIFT) != 0))
+    {
+      shiftedDotHeldAsGreater = true;
+    }
+    if (shiftedDotHeldAsGreater)
+    {
+      entry.key = PCW_KEY_HASH;
+    }
+  }
   const uint8_t keyIndex =
       mapped ? static_cast<uint8_t>(entry.key) : PCW_KEY_COUNT;
   const bool validKey = mapped && keyIndex < PCW_KEY_COUNT;
@@ -1247,6 +1262,10 @@ void updatePcwState(const KeyEvent &event)
       {
         applyKeyState(entry.key, false);
       }
+    }
+    if (ps2Code == PS2_KEY_DOT)
+    {
+      shiftedDotHeldAsGreater = false;
     }
   }
 }

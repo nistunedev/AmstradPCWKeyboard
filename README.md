@@ -45,52 +45,47 @@ diagnostic utility. The diagnostic can also be rebuilt and inserted by running
 
 ## Development Status
 
-The transmitter and PS/2 key path have been validated with a logic analyser
-(1 MHz timing capture, VCD export decoded offline). Confirmed working:
+The Arduino Nano firmware has now been validated on a real Amstrad PCW8256 as a working PS/2-to-PCW keyboard emulator. The current build uses a Timer1-driven PCW transmitter state machine and PS/2 host-inhibit handling so the PS/2 keyboard is only allowed to talk while the PCW frame transmitter is in a safe inter-frame window.
 
-- **Clock waveform** — per bit ~12 µs high / ~21 µs low, with one high pulse
-  per 12-bit word omitted so the real CLK holds low for an extended (~54 µs)
-  merged low, matching the real keyboard's skipped pulse.
-- **Frame structure** — 17 words per frame, offset nibbles run
-  `F, 0, 1, … , E, F` with no slippage; transmitting flag (bit 7 of byte 0xF)
-  set on the first word and clear on the last; update-toggle (bit 6 of 0xF)
-  alternates every frame; link-status byte 0xD reads `0x80` (LK1 not fitted).
-- **Inter-frame gap** - ~6.25 ms, with the attached keyboard's driven
-  resting state low on both `CLK` and `DATA`.
-- **DATA/CLK alignment** — DATA is stable across each bit and latched on the
-  CLK falling edge; decoding DATA against the clock recovers each word cleanly.
-- **End-to-end key path** — pressing `A` (PS/2) sets byte 0x08 bit 5 (`0x20`)
-  in the transmitted frame and clears it on release, with all other bytes
-  unchanged. This exercises the full chain: PS/2 make/break → key map → matrix
-  → frame build → ISR bit-bang → correctly framed PCW output.
+Confirmed working on hardware:
 
-Logic-analyser capture of one frame (WORD0 highlighted) and the start-of-frame
-detail used to verify DATA/CLK alignment:
+- **PCW framing** - the PCW receives stable keyboard-state frames with no idle keyboard garbage.
+- **PS/2 key path** - PS/2 make/break events are decoded, mapped into the PCW matrix, transmitted, and released correctly with immediate response.
+- **PS/2 host inhibit** - while the Arduino is actively transmitting a PCW frame, it holds the PS/2 clock line low so the PS/2 keyboard waits instead of sending bits that would be missed while the PCW timing ISR is protected.
+- **Inter-frame PS/2 service window** - PCW frame output can pause briefly between frames while PS/2 activity completes; the PCW keeps its most recent keyboard state in memory, so this is preferable to corrupting either protocol.
+- **Matrix polarity** - idle matrix bytes are `00`, and pressed keys set bits. The link/status bytes match the observed idle state for the current link configuration.
+
+The PCW transmitter deliberately follows the behaviours the PCW gate array actually needs rather than trying to reproduce every analyser measurement exactly. The important working features are the word structure, DATA/CLK relationship, two DATA preamble pulses before each word, the longer low gap after the fourth clock pulse, and clean inter-frame idle. The exact pulse widths have some tolerance on real hardware.
+
+Diagnostic build flags at the top of the firmware now select only the run mode:
+
+- `DIAG_FULL_EMULATOR` - normal PS/2-to-PCW operation.
+- `DIAG_PS2_ONLY` - dumps decoded PS/2 events to serial.
+- `DIAG_PCW_OUTPUT_ONLY` - transmits the PCW frame stream without PS/2 input.
+
+A D6 diagnostic pin mirrors the PCW clock output for scope/analyser comparison.
+
+### Current protocol notes
+
+- The PCW receives 17 12-bit words per frame.
+- Words are sent MSB first.
+- Word order is `0Fh` with transmit bit set, offsets `00h` through `0Eh`, then `0Fh` with transmit bit clear.
+- Between frames, an attached keyboard/emulator drives both `CLK` and `DATA` low.
+- Before each 12-bit word, the keyboard/emulator emits two DATA-only high pulses while CLK remains low. These pulses are necessary for reliable real-PCW behaviour in this implementation.
+- Each data bit is presented so DATA changes during the clock-high phase and is stable by the clock edge used by the PCW input logic.
+- The low period after the fourth clock pulse in each word is longer than the normal bit gap and acts as a per-word timing marker.
+- The measured real-keyboard traces are a guide, but the PCW hardware accepts small timing differences; exact logic-analyser pulse widths did not need to be matched perfectly once the framing markers and DATA timing were correct.
+
+Logic-analyser capture of one frame (WORD0 highlighted) and the start-of-frame detail used during protocol investigation:
 
 ![Frame with WORD0 highlighted](images/PCW%20James%20Logic%20frame1%20highlighted.png)
 
 ![Start-of-frame zoom](images/PCW%20James%20Logic%20frame1%20zoomed.png)
 
-Diagnostic build flags at the top of the firmware select the run mode
-(`DIAG_FULL_EMULATOR` for normal operation, `DIAG_PS2_ONLY` to dump decoded
-PS/2 keys to serial, `DIAG_PCW_OUTPUT_ONLY` to transmit an idle frame,
-`DIAG_CLK_TIMING_TEST` for a bare clock toggle) plus isolation toggles
-(`DIAG_DISABLE_WORD_SKIP`, `DIAG_FORCE_DATA_LOW`, `DIAG_DISABLE_TIMER0_IRQ`)
-and `PCW_INVERT_CLK` for physical clock polarity. A D6 diagnostic pin mirrors
-the clock without the per-word skip, as a uniform reference for scope/analyser
-comparison.
-
 ### Open items
 
-- **Not yet tested against a real PCW.** `KEYTEST.COM` on actual hardware is
-  needed to confirm `PCW_INVERT_CLK` polarity is electrically correct (the
-  analyser alone can't distinguish a real inversion from a probe/channel
-  setting) and that the ~54 µs merged low is accepted by the gate array.
-- **~32 ms transmit pause on key events.** Each PS/2 make/break coincides with
-  the transmitter stalling for ~32 ms (about five frames) before resuming
-  mid-frame where it left off. No bits are lost and it is likely harmless, but
-  the cause (something blocking the transmitter ISR during key handling) is not
-  yet understood.
+- More PS/2 keyboards should be tested to confirm host-inhibit behaviour across different keyboard controllers.
+- The current protocol is validated for the PCW8256 test machine; PCW variants should be checked before claiming universal compatibility.
 
 ## Tools
 
@@ -248,31 +243,33 @@ Emulator wiring (Arduino Nano to the PCW keyboard connector, with series and pul
 ![Emulator schematic](images/schematic.png)
 
 
-## 10.4.2 Clock signal 
+## 10.4.2 Clock signal
+
 From James:
 
 ![James PCW keyboard logic analysis](images/James_PCW_Keyboard_logic_analysis.png)
 
-Clock pulses note that there's only a 21µs gap between most clock pulses, although there is a 48µs gap after the fourth clock pulse.
+The real keyboard trace shows regular clocking with a longer gap after the fourth clock pulse of each 12-bit word. That longer low period is treated by this project as a per-word timing marker.
 
-The data signal is valid on the back-end of the clock signal, not at the start. (Although since his clock signal is inverted, it is actually correct that it is valid on the falling edge of the clock!)
+The working Arduino implementation uses a fixed Timer1 tick and keeps the DATA transition in the middle of the clock-high phase. DATA is therefore stable by the clock edge used by the PCW input circuitry. In practice the PCW gate array accepted timing that was close to, but not exactly identical to, the captured keyboard trace. The reliable behaviour came from preserving the protocol shape: two DATA preamble pulses, 12 clocked bits, the fourth-clock longer low marker, and clean low/low inter-frame idle.
 
-Assumption:
-So long as the clock signal is within certain tolerances I would guess that the gate array just clocks the signal in on the falling edge of the clock.
-
-To send a bit, the keyboard drives the data line low or high, pulls the clock line low, and then a little later returns them both to high. 
-
-Notes:
-PCW motherboard seems happy to accept timings similar to those used by the PC1512 keyboard (set data, wait for 5µs, set clock, wait for 5µs, return both lines to high, wait for 40µs).
+The PCW input path passes CLK and DATA through two Schmitt-trigger inverter stages, so the emulator does not logically invert the protocol for the PCW side.
 
 ## 10.4.2 Wire protocol
-Unlike a PC keyboard, the PCW keyboard does not send scancodes. Instead, it repeatedly sends the entire keyboard state: 17 words of 12 bits each
 
-A keycode is 12 bits long, with the most significant bit first. The first four bits are the offset in the memory map (0-0Fh), and the last eight bits are the value to be placed into memory at that address. The PCW keyboard toggles the DATA line twice before sending each word, but the gate array at the PCW end doesn’t seem to need this.
+Unlike a PC keyboard, the PCW keyboard does not send scancodes. It repeatedly sends the complete keyboard state as a frame of 17 words, with each word containing a memory-map offset and the byte value for that offset.
 
-1. Full keyboard state is 17 words; 
-2. When transmitting its state, the controller sends a 17-keycode (word) packet representing the full keyboard state
-3. First word word is byte 0Fh with the top bit set to 1;
-4. Next words are bytes 0-0Eh;
-5. Last words is byte 0Fh with the top bit set to 0.
+Each word is 12 bits, sent MSB first:
 
+- bits 11..8: memory-map offset `0h` to `Fh`
+- bits 7..0: byte value to place at that offset
+
+The frame order is:
+
+1. offset `0Fh` with bit 7 set, indicating transmit active
+2. offsets `00h` through `0Eh`
+3. offset `0Fh` with bit 7 clear, indicating transmit complete
+
+Before each 12-bit word, the keyboard/emulator emits two DATA-only high pulses while CLK stays low. Earlier notes suggested the PCW gate array may not need these; real-hardware testing showed that including them is necessary for stable operation with this firmware and wiring.
+
+Within each word, the low period after the fourth clock pulse is longer than the normal inter-bit low period. This marker is also required for stable word alignment. The exact durations do not need to match the analyser captures perfectly, but the relative structure must remain: preamble pulses, clocked bits, fourth-clock longer low gap, then the next word.
