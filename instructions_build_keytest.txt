@@ -1,0 +1,59 @@
+KEYTEST.COM build and transfer instructions
+===========================================
+
+KEYTEST.COM continuously snapshots the PCW keyboard bytes at BFF0h-BFFFh,
+ORs them into a latch buffer, displays the latched bits at 3FF0h-3FFFh,
+and clears the latch after each display refresh.
+
+KEYTEST never reads the console, so phantom key streams cannot exit it; reset
+the PCW to leave the diagnostic. It prints a BDOS message, waits for one key, and returns
+to CP/M.
+
+Build
+-----
+
+1. Open a command prompt in the project folder.
+2. Run:
+
+   build_keytest.bat
+
+Pasmo assembles both programs as headerless CP/M COM files in:
+
+   cpm_transfer
+
+The build also copies INSTALL.SUB into that folder.
+
+Safe CP/M Box transfer
+----------------------
+
+CPM_14_keyboard.dsk is a SAMdisk Extended DSK. Do not modify it with the
+bundled iDSK 0.20 or the tested cpmtools build. Both misinterpret this image's
+track geometry and can create directory entries whose data loads as garbage.
+The concrete iDSK bug evidence (phantom tracks 40/41 from SAMdisk's Offset-Info
+trailer, and the sector interleave/skew iDSK ignores on write) is recorded in
+idsk_issues.md, to be filed upstream (github.com/cpcsdk/idsk) in a later session.
+
+1. In CP/M Box, map the project's cpm_transfer folder as CP/M drive M:.
+2. Boot CP/M Plus with CPM_14_keyboard.dsk in drive A:.
+3. Run the installation submit file:
+
+   SUBMIT M:INSTALL
+
+INSTALL.SUB removes stale copies, copies KEYTEST.COM and INSTALL.SUB from M: to A:, then lists the A: directory.
+
+4. Run:
+
+   KEYTEST
+
+6. Use CP/M Box's Drive A / Dump command to save the modified disk image.
+
+Background
+----------
+
+An earlier ChatGPT-generated build used iDSK file type 1, which added an
+AMSDOS header to KEYTEST.COM. Changing to raw type 2 removed that header, but
+iDSK still wrote the Extended DSK using incompatible track geometry. CP/M Box
+then loaded repeating filler bytes instead of the assembled COM program.
+
+The M: drive and PIP procedure avoids external disk-geometry handling and lets
+the emulated CP/M BIOS write the disk correctly.
