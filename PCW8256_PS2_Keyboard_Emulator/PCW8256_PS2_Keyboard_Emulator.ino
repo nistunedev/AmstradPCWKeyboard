@@ -34,43 +34,6 @@
 #define DIAG_PCW_OUTPUT_ONLY 0
 #define DIAG_PS2_ONLY        0
 #define DIAG_FULL_EMULATOR   1
-// Bypasses Timer1/the ISR entirely and just busy-loops CLK low 21us / high
-// 12us via delayMicroseconds(). Enable this alone (set the others to 0) to
-// check whether basic 21/12us timing holds on this board, decoupled from
-// the ISR state machine, when chasing a timing discrepancy.
-#define DIAG_CLK_TIMING_TEST  0
-// When 1, all clock lows are a uniform ~21us (no per-word marker). When 0
-// (normal), all 12 pulses fire but the low after the 4th pulse is stretched
-// to ~48us as the per-word sync marker James measured. Keep 0 for real
-// hardware; set 1 only to test a plain square wave.
-#define DIAG_DISABLE_WORD_SKIP 0
-// When 1, omit the two DATA-only pulses that precede each word (clock the 17
-// words back-to-back with no preamble). Diagnostic for whether the preamble's
-// DATA edges are the source of the intermittent last-bit (value bit 0) latches
-// seen on real hardware. Set 0 for the normal per-word preamble.
-#define DIAG_DISABLE_WORD_PREAMBLE 0
-// Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
-// DATA never toggles. Use to test whether CLK timing irregularities are
-// correlated with DATA transitions (e.g. simultaneous-switching noise
-// between adjacent PORTD pins) rather than the CLK state machine itself.
-#define DIAG_FORCE_DATA_LOW 0
-// Disables Timer0's overflow interrupt in setup(), silencing the Arduino
-// millis()/micros() tick. The CTC-based scheduler no longer needs this (the
-// tick can delay a CLK edge by a few us but can't stretch a pulse width), so
-// keep it 0 for normal use. Only worth enabling for a pure DIAG_PCW_OUTPUT_ONLY
-// timing capture where you want the very tightest edges AND nothing depends on
-// millis(). Do NOT enable it with DIAG_FULL_EMULATOR / DIAG_PS2_ONLY: the PS/2
-// library and delay() rely on millis()/micros(), so freezing them can cause
-// missed or stuck keys. (delayMicroseconds() still works — it's a busy-loop.)
-#define DIAG_DISABLE_TIMER0_IRQ 0
-// Milliseconds to hold the lines idle (no clocking, so the PCW sees no keys)
-// at startup BEFORE the transmitter begins. This lets the PCW cold-boot and
-// PROFILE.SUB launch KEYTEST.COM without our frames spamming phantom
-// keypresses that abort the SUBMIT. Power the Arduino and PCW together (or
-// reset the Arduino as you boot the PCW): the Arduino stays silent for this
-// long, KEYTEST comes up, then transmission starts and KEYTEST shows the live
-// decoded bytes. Set 0 to transmit immediately.
-#define STARTUP_IDLE_MS 0UL
 
 namespace
 {
@@ -86,18 +49,8 @@ constexpr uint8_t PCW_DATA_PIN = 5;  // PCW keyboard DATA output (push-pull)
 // (this trace right, PCW_CLK_PIN still wrong).
 constexpr uint8_t DIAG_CLK_MIRROR_PIN = 6;  // diagnostic-only CLK echo, no external wiring
 
-// DIAG_CLK_TIMING_TEST is a standalone busy-loop bypass: it drives CLK from
-// loop() itself, so it must NOT be combined with any mode that also arms the
-// Timer1 ISR (which would then drive the same CLK pin — two writers, garbage
-// timing). Otherwise, exactly one of the three run modes must be selected.
-#if DIAG_CLK_TIMING_TEST
-  #if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 0
-  #error DIAG_CLK_TIMING_TEST is a standalone bypass; set the other DIAG_* modes to 0.
-  #endif
-#else
-  #if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 1
-  #error Exactly one diagnostic mode must be enabled.
-  #endif
+#if (DIAG_PCW_OUTPUT_ONLY + DIAG_PS2_ONLY + DIAG_FULL_EMULATOR) != 1
+#error Exactly one diagnostic mode must be enabled.
 #endif
 
 constexpr uint8_t PCW_STATE_BYTES = 16;  // pcwState[] size: one byte per memory-map offset (0x0..0xF)
@@ -149,19 +102,16 @@ constexpr uint16_t PS2_CODE_MASK = 0x00FFU;  // isolates the scancode byte from 
 constexpr uint32_t SERIAL_BAUD_RATE = 115200;  // USB-serial debug console baud rate
 constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY heartbeat print interval
 
-// PCW timing follows the observed 8048 keyboard waveform: per bit the clock
-// is high about 12 us then low about 21 us, and every 12-bit word has its
-// 5th bit's high pulse skipped (no rising edge on the real CLK), merging that
-// bit's low with the neighbouring lows into the extended low seen on the real
-// keyboard. The transmitter ISR uses two phases per bit (raise then lower),
-// toggling the pin as its first action each time, and times each interval
-// off the Timer1 CTC compare match, so pulse widths don't carry the ISR's
-// own work as jitter. The D6 mirror always pulses (no skip) as a reference.
+// PCW timing follows the observed 8048 keyboard waveform on a fixed 6us
+// Timer1 grid: each data bit has a 12us CLK-high window, DATA changes in the
+// middle of that high window, and the normal CLK-low gap is 24us. The low
+// after the fourth clock pulse is stretched to about 48us as the per-word
+// marker. The D6 mirror follows the same firmware timing as D3 as an analyser
+// reference.
 //
 // If set, the physical CLK pins are driven to the opposite of the logical
 // level (logical "high" phase -> physical low). Determined empirically per
-// rig: 0 makes the measured waveform read 12 us high / 21 us low like the
-// real keyboard on the current setup. Re-check against the real PCW with
+// rig: 0 makes the measured waveform match the real keyboard on the current setup. Re-check against the real PCW with
 // KEYTEST.COM; flip it if keys misread.
 #define PCW_INVERT_CLK 0
 
@@ -191,8 +141,6 @@ constexpr uint8_t PCW_CLOCK_FALL_STEP = 2;  // falling edge latches DATA into th
 constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // stretch the low after the 4th clock pulse as the per-word marker
 constexpr uint8_t PCW_INTER_WORD_GAP_TICKS = 24;  // 24 * 6us = 144us gap between words
 constexpr uint8_t PCW_TICK_COUNTS = (PCW_TICK_US * TIMER1_COUNTS_PER_US);  // Timer1 counts per 6us tick
-constexpr uint8_t PCW_CLOCK_HIGH_US = PCW_TICK_US * 2U;  // DIAG_CLK_TIMING_TEST compatibility
-constexpr uint8_t PCW_CLOCK_LOW_US = PCW_TICK_US * 4U;  // DIAG_CLK_TIMING_TEST compatibility
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -476,7 +424,7 @@ bool isIgnoredPs2Code(uint8_t code)
 // Drives the real PCW CLK (D3) to its logical-high state (the bit's 12 us
 // high phase). Push-pull OUTPUT backed by an external 10k pull-up. When
 // PCW_INVERT_CLK is set the physical pin is driven LOW here so the path to
-// the PCW presents a high — see PCW_INVERT_CLK above.
+// the PCW presents a high â€” see PCW_INVERT_CLK above.
 inline void pcwClockHigh()
 {
 #if PCW_INVERT_CLK
@@ -498,7 +446,7 @@ inline void pcwClockLow()
 }
 
 // Drives the diagnostic CLK mirror (D6) high/low. D6 shows the clock WITHOUT
-// the per-word skip applied — a uniform reference every bit — so it can be
+// the per-word skip applied â€” a uniform reference every bit â€” so it can be
 // compared on the scope against the real D3 CLK, which does skip. Uses the
 // same PCW_INVERT_CLK polarity as D3 so the two read alike on the analyser.
 inline void diagClockHigh()
@@ -604,6 +552,7 @@ inline void pcwLinesIdle()
     } \
   } while (0)
 
+#if DIAG_FULL_EMULATOR
 #define PCW_MASK_INPUT_IRQS_FAST() \
   do \
   { \
@@ -615,11 +564,13 @@ inline void pcwLinesIdle()
   do \
   { \
     EIMSK |= _BV(INT0); \
-    if (!DIAG_DISABLE_TIMER0_IRQ) \
-    { \
-      TIMSK0 |= _BV(TOIE0); \
-    } \
+    TIMSK0 |= _BV(TOIE0); \
   } while (0)
+#else
+#define PCW_MASK_INPUT_IRQS_FAST() do {} while (0)
+#define PCW_UNMASK_INPUT_IRQS_FAST() do {} while (0)
+#endif
+
 inline void maskPs2AndTimer0DuringPcwTransmit()
 {
 #if DIAG_FULL_EMULATOR
@@ -961,9 +912,6 @@ bool findJoystickMatrixEntry(PcwKey key, PcwMatrixEntry &result)
 // txBitIndex in the active frame buffer.
 void loadCurrentPcwData()
 {
-#if DIAG_FORCE_DATA_LOW
-  pcwDataLow();
-#else
   bool high = frameBuffers[activeFrameIndex][txBitIndex] != 0;
 #if PCW_INVERT_DATA
   high = !high;
@@ -976,10 +924,7 @@ void loadCurrentPcwData()
   {
     pcwDataLow();
   }
-#endif
 }
-
-
 // Starts building the next frame into the inactive frame buffer slot.
 void beginFrameBuild()
 {
@@ -1070,9 +1015,7 @@ void sendPcwFrame()
 // serial banner.
 const __FlashStringHelper *activeDiagnosticModeName()
 {
-  #if DIAG_CLK_TIMING_TEST
-  return F("DIAG_CLK_TIMING_TEST");
-  #elif DIAG_PCW_OUTPUT_ONLY
+  #if DIAG_PCW_OUTPUT_ONLY
   return F("DIAG_PCW_OUTPUT_ONLY");
   #elif DIAG_PS2_ONLY
   return F("DIAG_PS2_ONLY");
@@ -1422,11 +1365,6 @@ ISR(TIMER1_COMPA_vect)
       break;
 
     case TxState::Preamble:
-#if DIAG_DISABLE_WORD_PREAMBLE
-      txWordPhaseTick = 0;
-      txClockStep = 0;
-      txState = TxState::ClockBits;
-#else
       if (txWordPhaseTick == 1 || txWordPhaseTick == 3)
       {
         PCW_DATA_HIGH_FAST();
@@ -1441,13 +1379,11 @@ ISR(TIMER1_COMPA_vect)
         txClockStep = 0;
         txState = TxState::ClockBits;
       }
-#endif
       break;
 
     case TxState::ClockBits:
     {
-      const bool longLowThisBit = !DIAG_DISABLE_WORD_SKIP &&
-                                  txBitInWord == PCW_WORD_LONG_LOW_BIT;
+      const bool longLowThisBit = txBitInWord == PCW_WORD_LONG_LOW_BIT;
       const uint8_t bitSlotTicks = longLowThisBit ?
           PCW_CLOCK_LONG_LOW_STEPS_PER_BIT : PCW_CLOCK_STEPS_PER_BIT;
 
@@ -1458,9 +1394,6 @@ ISR(TIMER1_COMPA_vect)
       }
       else if (txClockStep == PCW_CLOCK_DATA_STEP)
       {
-#if DIAG_FORCE_DATA_LOW
-        PCW_DATA_LOW_FAST();
-#else
         const uint8_t bitValue = txFrameBits[txBitIndex];
         if (bitValue)
         {
@@ -1470,7 +1403,6 @@ ISR(TIMER1_COMPA_vect)
         {
           PCW_DATA_LOW_FAST();
         }
-#endif
       }
       else if (txClockStep == PCW_CLOCK_FALL_STEP)
       {
@@ -1585,22 +1517,6 @@ void setup()
   // is sized for the default 0.5s delay.
   #endif
 
-  #if (DIAG_PCW_OUTPUT_ONLY || DIAG_FULL_EMULATOR) && (STARTUP_IDLE_MS > 0)
-  // Hold the lines idle (set above) so the PCW can boot and KEYTEST can start
-  // before we begin transmitting. delay() needs Timer0, so do this before any
-  // DIAG_DISABLE_TIMER0_IRQ below.
-  Serial.print(F("Holding idle "));
-  Serial.print(STARTUP_IDLE_MS);
-  Serial.println(F(" ms before transmit..."));
-  delay(STARTUP_IDLE_MS);
-  Serial.println(F("Starting PCW transmit."));
-  #endif
-
-  #if DIAG_DISABLE_TIMER0_IRQ
-  // Silence the millis()/micros() tick so it cannot preempt the CLK ISR.
-  TIMSK0 &= static_cast<uint8_t>(~_BV(TOIE0));
-  #endif
-
   #if DIAG_PCW_OUTPUT_ONLY || DIAG_FULL_EMULATOR
   sendPcwFrame();
   setupTimer1();
@@ -1608,24 +1524,12 @@ void setup()
 }
 
 // Arduino main loop. Behaviour depends on the compiled DIAG_* mode:
-// DIAG_CLK_TIMING_TEST busy-loops a bare 21us/12us CLK toggle with no ISR
-// or state machine involved, to isolate basic timing accuracy; DIAG_PCW_OUTPUT_ONLY
-// just keeps the transmitter fed and prints a heartbeat; DIAG_PS2_ONLY dumps
-// raw PS/2 events to serial; DIAG_FULL_EMULATOR drains PS/2 events into PCW
-// state and (re)builds the transmit frame.
+// DIAG_PCW_OUTPUT_ONLY just keeps the transmitter fed and prints a heartbeat;
+// DIAG_PS2_ONLY dumps raw PS/2 events to serial; DIAG_FULL_EMULATOR drains
+// PS/2 events into PCW state and (re)builds the transmit frame.
 void loop()
 {
-  #if DIAG_CLK_TIMING_TEST
-  pcwClockLow();
-  diagClockLow();
-  delayMicroseconds(PCW_CLOCK_LOW_US);
-  pcwClockHigh();
-  diagClockHigh();
-  delayMicroseconds(PCW_CLOCK_HIGH_US);
-  return;
-  #endif
-
-  #if DIAG_PCW_OUTPUT_ONLY
+#if DIAG_PCW_OUTPUT_ONLY
   static uint32_t lastHeartbeatMs = 0;
   sendPcwFrame();
   if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS)
