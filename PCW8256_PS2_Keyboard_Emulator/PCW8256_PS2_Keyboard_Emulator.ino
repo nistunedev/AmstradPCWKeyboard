@@ -44,6 +44,11 @@
 // to ~48us as the per-word sync marker James measured. Keep 0 for real
 // hardware; set 1 only to test a plain square wave.
 #define DIAG_DISABLE_WORD_SKIP 0
+// When 1, omit the two DATA-only pulses that precede each word (clock the 17
+// words back-to-back with no preamble). Diagnostic for whether the preamble's
+// DATA edges are the source of the intermittent last-bit (value bit 0) latches
+// seen on real hardware. Set 0 for the normal per-word preamble.
+#define DIAG_DISABLE_WORD_PREAMBLE 0
 // Forces PCW_DATA_PIN low at all times, ignoring the actual bit value, so
 // DATA never toggles. Use to test whether CLK timing irregularities are
 // correlated with DATA transitions (e.g. simultaneous-switching noise
@@ -167,7 +172,7 @@ constexpr uint32_t HEARTBEAT_INTERVAL_MS = 1000UL;  // DIAG_PCW_OUTPUT_ONLY hear
 
 constexpr uint16_t TIMER1_PRESCALER = 8;  // Timer1 clock/8, giving TIMER1_COUNTS_PER_US counts per microsecond
 constexpr uint16_t TIMER1_COUNTS_PER_US = F_CPU / TIMER1_PRESCALER / 1000000UL;  // Timer1 ticks per microsecond
-constexpr uint8_t PCW_CLOCK_HIGH_US = 12;  // CLK-high duration per bit
+constexpr uint8_t PCW_CLOCK_HIGH_US = 12;  // total CLK-high duration per bit
 constexpr uint8_t PCW_CLOCK_LOW_US = 21;  // normal CLK-low duration per bit
 constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse the old skip omitted
 // All 12 pulses are sent, but the LOW after the 4th pulse (i.e. after bit
@@ -178,7 +183,8 @@ constexpr uint8_t PCW_WORD_SKIP_BIT_INDEX = 4;  // (legacy) bit whose high pulse
 constexpr uint8_t PCW_CLOCK_LONG_LOW_US = 48;  // extended CLK-low after the 4th pulse of each word
 constexpr uint8_t PCW_WORD_LONG_LOW_BIT = 3;  // low following this bit's pulse is the long one
 constexpr uint16_t PCW_FRAME_GAP_US = 6250;  // idle time between the end of one frame and the start of the next
-constexpr uint8_t PCW_DATA_TOGGLE_US = 12;  // hold time for each DATA-only pre-word pulse edge
+constexpr uint8_t PCW_PREAMBLE_PULSE_US = 6;  // each pre-word DATA half-pulse (high/low/high), CLK low
+constexpr uint8_t PCW_PREAMBLE_TAIL_US = 30;  // DATA held high after the preamble before CLK rises
 constexpr char BUILD_DATE[] = __DATE__;  // compile-time build date, printed in the startup banner
 constexpr char BUILD_TIME[] = __TIME__;  // compile-time build time, printed in the startup banner
 
@@ -354,21 +360,23 @@ struct PcwKeyMatrixEntry
 };
 
 // Transmitter bit-clock state machine, driven one step per call of
-// ISR(TIMER1_COMPA_vect). Each 12-bit word starts with the two DATA-only
-// pulses documented for the 8048 keyboard, then two phases per bit toggle
-// CLK: RaiseClock drives CLK high for PCW_CLOCK_HIGH_US, LowerClock drives
-// CLK low for PCW_CLOCK_LOW_US (latching that bit's DATA on the falling edge)
-// then advances to the next bit.
+// ISR(TIMER1_COMPA_vect). Each 12-bit word is preceded by a DATA-only preamble
+// (all with CLK low): high/low/high/low in PCW_PREAMBLE_PULSE_US steps,
+// then a PCW_PREAMBLE_TAIL_US hold before CLK rises. Each data bit is two
+// phases: ClockRise raises CLK and sets this bit's DATA (so DATA changes during
+// the CLK-high), and ClockFall drops CLK (latching DATA on the falling edge)
+// then advances. DATA therefore only ever changes during CLK-high (data) or in
+// the preamble (sync), never during a data bit's CLK-low.
 enum class TxPhase : uint8_t
 {
   FrameGap = 0,
-  WordDataToggle1 = 1,
-  WordDataToggle2 = 2,
-  WordDataToggle3 = 3,
-  WordDataToggle4 = 4,
-  WordDataSetup = 5,
-  RaiseClock = 6,
-  LowerClock = 7
+  PreambleHigh1 = 1,  // DATA high, PCW_PREAMBLE_PULSE_US (CLK low)
+  PreambleLow1 = 2,   // DATA low,  PCW_PREAMBLE_PULSE_US
+  PreambleHigh2 = 3,  // DATA high, PCW_PREAMBLE_PULSE_US
+  PreambleLow2 = 4,   // DATA low,  PCW_PREAMBLE_PULSE_US
+  PreambleTail = 5,   // DATA held low, PCW_PREAMBLE_TAIL_US, then CLK rises
+  ClockRise = 6,      // CLK high + set this bit's DATA, hold the 12us high
+  ClockFall = 7       // CLK low (latch), advance, then the CLK-low period
 };
 
 volatile uint8_t pcwState[PCW_STATE_BYTES];  // live PCW state bytes, one per memory-map offset
@@ -893,29 +901,6 @@ void loadCurrentPcwData()
 #endif
 }
 
-// Entry point for the first bit of a frame (from TxPhase::FrameGap): sets
-// that bit's DATA, raises CLK to begin its high phase, and hands off to
-// LowerClock which will drop CLK (latching the bit) after PCW_CLOCK_HIGH_US.
-void startCurrentPcwBit()
-{
-  loadCurrentPcwData();
-  pcwClockHigh();   // real CLK (D3)
-  diagClockHigh();  // mirror (D6) — bit 0 is never the skip bit
-  scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-  txPhase = TxPhase::LowerClock;
-}
-
-// Starts the two DATA-only pulses that precede each 12-bit word.
-// CLK remains low throughout; WordDataSetup then loads the first word bit
-// and raises CLK to begin normal bit transmission.
-void startCurrentPcwWordPreamble()
-{
-  pcwClockLow();
-  diagClockLow();
-  pcwDataToggle();
-  scheduleTimer1Us(PCW_DATA_TOGGLE_US);
-  txPhase = TxPhase::WordDataToggle2;
-}
 
 // Starts building the next frame into the inactive frame buffer slot.
 void beginFrameBuild()
@@ -1224,19 +1209,18 @@ void setupTimer1()
   sei();
 }
 
-// Main transmitter state machine, one step per Timer1 compare-match. Two
-// phases per bit, each toggling CLK as its very first instruction so the
-// pulse width never carries the ISR's own work as jitter:
-//   RaiseClock -> CLK high, wait PCW_CLOCK_HIGH_US   (~12us high)
-//   LowerClock -> CLK low (latches this bit's DATA), advance to the next
-//                 bit, load its DATA, wait PCW_CLOCK_LOW_US (~21us low)
-// The per-word skip bit is handled in RaiseClock: on the skip bit the real
-// CLK (D3) rising edge is omitted, so D3 stays low across that bit and its
-// low merges with the neighbouring lows into the extended low seen on the
-// real keyboard. The D6 mirror always pulses (every bit), giving a uniform
-// no-skip reference to compare against D3 on the analyser. FrameGap holds
-// the lines idle during the inter-frame gap; its timer firing starts the
-// first bit of a fresh frame via startCurrentPcwBit().
+// Main transmitter state machine, one step per Timer1 compare-match. Each
+// word is preceded by a DATA-only preamble (PreambleHigh1/Low1/High2/Low2/Tail,
+// all with CLK low: high/low/high/low in PCW_PREAMBLE_PULSE_US steps, then a
+// PCW_PREAMBLE_TAIL_US hold). Each data bit is two phases:
+//   ClockRise -> CLK high + set this bit's DATA, wait PCW_CLOCK_HIGH_US
+//   ClockFall -> CLK low (latches DATA on the falling edge), advance, then the
+//                CLK-low period (PCW_CLOCK_LOW_US, or PCW_CLOCK_LONG_LOW_US
+//                after bit 3 as the per-word sync marker)
+// DATA thus only ever changes during CLK-high (data) or in the preamble
+// (sync), never during a data bit's CLK-low. The D6 mirror pulses every bit as an
+// analyser reference. FrameGap holds the lines idle during the inter-frame
+// gap; its timer firing starts the first word's preamble.
 ISR(TIMER1_COMPA_vect)
 {
   const uint8_t currentFrame = activeFrameIndex;
@@ -1251,46 +1235,68 @@ ISR(TIMER1_COMPA_vect)
   switch (txPhase)
   {
     case TxPhase::FrameGap:
-      startCurrentPcwWordPreamble();
+      // Start of a frame = start of the first word's preamble.
+      pcwClockLow();
+      diagClockLow();
+#if DIAG_DISABLE_WORD_PREAMBLE
+      // No preamble: raise CLK and set bit 0's DATA, straight into its high.
+      pcwClockHigh();
+      diagClockHigh();
+      loadCurrentPcwData();
+      scheduleTimer1Us(PCW_CLOCK_HIGH_US);
+      txPhase = TxPhase::ClockFall;
+#else
+      pcwDataLow();  // preamble begins from a low DATA level ("1. low")
+      scheduleTimer1Us(PCW_CLOCK_LOW_US);
+      txPhase = TxPhase::PreambleHigh1;
+#endif
       break;
 
-    case TxPhase::WordDataToggle1:
-      startCurrentPcwWordPreamble();
+    case TxPhase::PreambleHigh1:
+      pcwDataHigh();
+      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
+      txPhase = TxPhase::PreambleLow1;
       break;
 
-    case TxPhase::WordDataToggle2:
-      pcwDataToggle();
-      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
-      txPhase = TxPhase::WordDataToggle3;
+    case TxPhase::PreambleLow1:
+      pcwDataLow();
+      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
+      txPhase = TxPhase::PreambleHigh2;
       break;
 
-    case TxPhase::WordDataToggle3:
-      pcwDataToggle();
-      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
-      txPhase = TxPhase::WordDataToggle4;
+    case TxPhase::PreambleHigh2:
+      pcwDataHigh();
+      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
+      txPhase = TxPhase::PreambleLow2;
       break;
 
-    case TxPhase::WordDataToggle4:
-      pcwDataToggle();
-      scheduleTimer1Us(PCW_DATA_TOGGLE_US);
-      txPhase = TxPhase::WordDataSetup;
+    case TxPhase::PreambleLow2:
+      pcwDataLow();
+      scheduleTimer1Us(PCW_PREAMBLE_PULSE_US);
+      txPhase = TxPhase::PreambleTail;
       break;
 
-    case TxPhase::WordDataSetup:
-      startCurrentPcwBit();
+    case TxPhase::PreambleTail:
+      // DATA stays low; wait, then raise CLK for the first data bit (which
+      // drives DATA to its value just after the rising edge).
+      scheduleTimer1Us(PCW_PREAMBLE_TAIL_US);
+      txPhase = TxPhase::ClockRise;
       break;
 
-    case TxPhase::RaiseClock:
-      // Every bit gets a full clock pulse (12 pulses per 12-bit word). The
-      // per-word marker is a longer LOW after the 4th pulse, applied in
-      // LowerClock — not an omitted pulse.
+    case TxPhase::ClockRise:
+      // Raise CLK and set this bit's DATA together: DATA changes just after the
+      // rising edge (during CLK-high, off the CLK-low sync region), then holds
+      // stable for the whole 12us high until the falling-edge latch. Kept as a
+      // single 12us interval (not split at mid-high) so the ISR firing rate
+      // stays low enough for the PS/2 receive interrupt.
       diagClockHigh();
       pcwClockHigh();
+      loadCurrentPcwData();
       scheduleTimer1Us(PCW_CLOCK_HIGH_US);
-      txPhase = TxPhase::LowerClock;
+      txPhase = TxPhase::ClockFall;
       break;
 
-    case TxPhase::LowerClock:
+    case TxPhase::ClockFall:
     {
       pcwClockLow();
       diagClockLow();
@@ -1336,24 +1342,31 @@ ISR(TIMER1_COMPA_vect)
 
       // The low following the 4th pulse (bit 3) is stretched to ~48us as the
       // per-word sync marker; every other low is the normal ~21us.
-      {
-        uint16_t lowUs = PCW_CLOCK_LOW_US;
+      uint16_t lowUs = PCW_CLOCK_LOW_US;
 #if !DIAG_DISABLE_WORD_SKIP
-        if (justLatched == PCW_WORD_LONG_LOW_BIT)
-        {
-          lowUs = PCW_CLOCK_LONG_LOW_US;
-        }
-#endif
-        scheduleTimer1Us(lowUs);
+      if (justLatched == PCW_WORD_LONG_LOW_BIT)
+      {
+        lowUs = PCW_CLOCK_LONG_LOW_US;
       }
+#endif
       if (txBitInWord == 0)
       {
-        txPhase = TxPhase::WordDataToggle1;
+        // Word boundary: DATA holds the just-latched last bit through this low.
+#if DIAG_DISABLE_WORD_PREAMBLE
+        scheduleTimer1Us(lowUs);
+        txPhase = TxPhase::ClockRise;
+#else
+        pcwDataLow();  // preamble begins from a low DATA level ("1. low")
+        scheduleTimer1Us(lowUs);
+        txPhase = TxPhase::PreambleHigh1;
+#endif
       }
       else
       {
-        loadCurrentPcwData();
-        txPhase = TxPhase::RaiseClock;
+        // DATA holds the just-latched bit's level through the low; the next
+        // bit's DATA is set in ClockRise, just after CLK rises.
+        scheduleTimer1Us(lowUs);
+        txPhase = TxPhase::ClockRise;
       }
       break;
     }
